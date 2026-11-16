@@ -10,6 +10,17 @@ It is also a way of working with an agent: **take as little human attention as p
 
 ## Setup
 
+### Codex Migration Preview
+
+新增独立 Codex 本地任务服务与插件入口，保留原 DSH 原型。**当前为开发预览：任务/MCP/只读看板可启动，真实 Worker 因 P0 安全与恢复验收未完成而禁用；尚未完成完整 v1。** 没有自动安装插件、复制账号、启动模型或向远端推送。
+
+- [实施与验收状态](docs/codex-implementation-status.md)：逐项区分代码、fixture 测试和真实执行证据。
+- [Codex 使用说明](docs/codex-usage.md)：构建、初始化、服务、MCP、审批、看板和恢复。
+- 新运行时检查：`npm --prefix packages ci --ignore-scripts && npm run check:codex`。
+- CLI 帮助：`node packages/dist/service/src/cli.js help`。
+
+### Original DSH Prototype
+
 Setup has many steps, so an agent does it with you. Ask your coding agent:
 
 > Read SETUP.md in this repository and set up dsh-superagent with me.
@@ -29,7 +40,7 @@ Read the numbered documents in order; each builds only on the ones before it.
 - [006 Deployment](docs/006-deployment.md): manual setup, configuration, upgrades and troubleshooting
 - [007 Architecture](docs/007-architecture.md)
 - [008 Cookbook](docs/008-cookbook.md): adding a Source
-- [009 Codex Plugin Design](docs/009-codex-plugin-design.md): proposed migration of task management, execution, PR delivery, supervision and recovery to Codex (中文设计文档; not implemented)
+- [009 Codex Plugin Design](docs/009-codex-plugin-design.md): migration design baseline for task management, execution, PR delivery, supervision and recovery (中文设计文档; implementation in progress)
 
 ## Development
 
