@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "superagent": {
+      "command": "superagent-local",
+      "args": ["mcp", "bridge"]
+    }
+  }
+}

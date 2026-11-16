@@ -1,0 +1,11 @@
+{
+  "compilerOptions": {
+    "target": "ES2023", "module": "ESNext", "moduleResolution": "Bundler", "jsx": "react",
+    "strict": true, "noEmit": true, "skipLibCheck": true,
+    "paths": {
+      "react": ["../../packages/node_modules/@types/react/index.d.ts"],
+      "react-dom/client": ["../../packages/node_modules/@types/react-dom/client.d.ts"]
+    }
+  },
+  "include": ["src/**/*.tsx", "src/**/*.d.ts"]
+}

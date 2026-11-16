@@ -1,0 +1,19 @@
+{
+  "name": "superagent",
+  "version": "0.1.0",
+  "description": "Manage manually authorized local coding tasks through an independent task service.",
+  "author": {
+    "name": "Local developer"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Superagent",
+    "shortDescription": "Manage supervised local coding tasks.",
+    "longDescription": "Create and inspect tasks, request execution and publication, and preserve human stop and approval boundaries. Requires a separately started local service.",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "Help me use Superagent."
+  },
+  "mcpServers": "./.mcp.json"
+}

@@ -4,20 +4,32 @@
   "private": true,
   "type": "module",
   "license": "MIT",
-  "engines": { "node": ">=24.2.0" },
-  "bin": { "superagent-local": "dist/service/src/cli.js" },
+  "engines": {
+    "node": ">=24.2.0"
+  },
+  "bin": {
+    "superagent-local": "dist/service/src/cli.js"
+  },
+  "files": ["dist/core", "dist/storage", "dist/service", "dist/executor-codex/src", "dist/integrations-github", "dist/mcp", "dist/panel", "dist/LICENSE", "README.md"],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && tsc -p ../apps/panel/tsconfig.json && node scripts/build-panel.mjs",
     "test": "node --test dist/tests/*.test.js",
     "check": "npm run build && npm test",
-    "probe": "node dist/executor-codex/src/probe.js"
+    "probe": "node dist/executor-codex/src/probe.js",
+    "prepack": "npm run build",
+    "configure-plugin": "node scripts/configure-plugin.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.2",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
     "zod": "4.4.3"
   },
   "devDependencies": {
     "@types/node": "24.10.1",
+    "@types/react": "18.3.28",
+    "@types/react-dom": "18.3.7",
+    "esbuild": "0.28.2",
     "typescript": "6.0.3"
   }
 }
