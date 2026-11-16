@@ -9,3 +9,5 @@ coverage/
 .superagent/
 .worktrees/
 .cache/
+packages/dist/
+plugins/superagent/runtime/
