@@ -2,7 +2,7 @@ export type Stage = 'draft' | 'queued' | 'working' | 'approval' | 'answer' | 'wa
 export interface Repository { id: string; path: string; remote: string; baseRef: string; baseSha: string; executionRoot: string; github?: string }
 export interface Input { id: string; text: string; source: 'manual' | 'github'; sequence: number; state: 'pending' | 'sending' | 'accepted' | 'settled'; createdAt: string }
 export interface Assignment { id: string; generation: number; state: 'pending' | 'running' | 'ended'; startedAt?: string; endedAt?: string }
-export interface Report { state: 'waiting' | 'ready' | 'blocked' | 'failed' | 'dropped'; summary: string; checks: string[]; question?: string }
+export interface Report { state: 'waiting' | 'ready' | 'blocked' | 'failed' | 'dropped'; summary: string; checks: string[]; question?: string | null }
 export interface Binding { threadId: string; turnId?: string; version: string; profileHash: string }
 export interface Pull { number: number; url: string; headSha: string; branch: string; state: 'open' | 'merged' | 'closed' }
 export interface Ticket {
@@ -18,7 +18,8 @@ export interface Approval {
   status: 'pending' | 'accepted' | 'declined' | 'expired'; createdAt: string; expiresAt: string
   revision: number; details: Record<string, unknown>; assignmentId?: string
 }
-export interface Effect { key: string; kind: 'launch' | 'stop' | 'publish'; ticketId: string; generation: number; payload: Record<string, unknown>; state: 'pending' | 'running' | 'uncertain' | 'done'; attempts: number; dueAt: number }
+export interface Effect { key: string; kind: 'launch' | 'stop' | 'publish'; ticketId: string; generation: number; payload: Record<string, unknown>; state: 'pending' | 'running' | 'uncertain' | 'done'; attempts: number; dueAt: number; lease?: { owner: string; claimedAt: number; expiresAt: number } }
+export interface PublishPreview { ticketId: string; revision: number; repository: string; branch: string; baseRef: string; baseSha: string; headSha: string; treeSha: string; diff: string; title: string; body: string; authorName: string; authorEmail: string; fingerprint: string }
 export interface Audit { sequence: number; ticketId: string; event: string; detail: unknown; at: string }
 export const latestAssignment = (ticket: Ticket): Assignment | undefined => ticket.assignments.at(-1)
 export function stage(ticket: Ticket, approvals: Approval[] = []): Stage {

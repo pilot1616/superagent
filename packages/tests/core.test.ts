@@ -32,7 +32,7 @@ test('execution requires explicit approval; stopped tasks stay held across messa
     const queued = engine.require(created.id)
     assert.equal(stage(queued), 'queued')
     engine.call('task_stop', { ticketId: created.id, expectedRevision: queued.revision, requestId: 'stop-00001', reason: 'Wait for me' })
-    engine.call('task_message', { ticketId: created.id, text: 'New clue, not permission to resume', requestId: 'message-0001' })
+    engine.call('task_message', { ticketId: created.id, expectedRevision: engine.require(created.id).revision, text: 'New clue, not permission to resume', requestId: 'message-0001' })
     engine.receiveFeedback(created.id, 'ci:1', 'CI changed')
     engine.recover()
     assert.equal(stage(engine.require(created.id)), 'stopped')
