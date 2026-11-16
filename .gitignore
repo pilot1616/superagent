@@ -2,4 +2,10 @@ node_modules/
 lib/
 .artifacts/
 .env
+.env.*
+!.env.example
 coverage/
+.DS_Store
+.superagent/
+.worktrees/
+.cache/

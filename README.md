@@ -29,6 +29,7 @@ Read the numbered documents in order; each builds only on the ones before it.
 - [006 Deployment](docs/006-deployment.md): manual setup, configuration, upgrades and troubleshooting
 - [007 Architecture](docs/007-architecture.md)
 - [008 Cookbook](docs/008-cookbook.md): adding a Source
+- [009 Codex Plugin Design](docs/009-codex-plugin-design.md): proposed migration of task management, execution, PR delivery, supervision and recovery to Codex (中文设计文档; not implemented)
 
 ## Development
 
