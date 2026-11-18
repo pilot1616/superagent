@@ -10,6 +10,11 @@ export const SUPPORTED_CODEX = 'codex-cli 0.154.0-alpha.6.2'
 export function codexVersion(binary = 'codex'): string {
   return execFileSync(binary, ['--version'], { encoding: 'utf8', timeout: 10_000 }).trim()
 }
+export async function checkWorker(state: string, binary = 'codex') {
+  const { inspectRuntime, publicInspection } = await import('./inspection.js')
+  const inspection = await inspectRuntime(state, 'diagnostic-only', 0, 60, binary)
+  return { diagnosticOnly: true, version: inspection.executable.version, compatible: inspection.executable.version === SUPPORTED_CODEX, handshake: inspection.checks.some(check => check.key === 'protocol_handshake' && check.status === 'passed'), restrictedConfigReadback: inspection.checks.some(check => check.key === 'effective_profile' && check.status === 'passed'), accountConfigured: inspection.auth.status === 'configured', model: inspection.model, provider: inspection.provider, inspection: publicInspection(inspection), status: 'diagnostic-only', modelTurnTested: false, filesystemIsolationTested: false, next: '本检查不登录、不执行模型、不形成生产验收证据；还需真实隔离、预算、请求、取消及多任务验收。' }
+}
 export async function probe(binary = 'codex') {
   const version = codexVersion(binary)
   if (version !== SUPPORTED_CODEX) throw new Error(`Unsupported Codex: ${version}; expected ${SUPPORTED_CODEX}`)
@@ -21,7 +26,8 @@ export async function probe(binary = 'codex') {
   try {
     await server.initialize()
     const { config } = await server.request<{ config: any }>('config/read', { includeLayers: false })
-    const restrictedConfigReadback = config.default_permissions === 'superagent-worker' && config.approval_policy === 'on-request' && config.permissions?.['superagent-worker']?.network?.enabled === false && ['plugins', 'remote_plugin', 'remote_control', 'tool_suggest', 'auth_elicitation', 'apps', 'multi_agent', 'multi_agent_v2'].every(name => config.features?.[name] === false) && Object.keys(config.mcp_servers ?? {}).length === 0
+    const { effectiveProfile } = await import('./inspection.js')
+    const restrictedConfigReadback = effectiveProfile(config, profile)
     if (!restrictedConfigReadback) throw new Error('Restricted Worker configuration did not survive App Server resolution')
     const account = await server.request<{ account?: unknown }>('account/read', { refreshToken: false })
     return { version, handshake: true, isolatedProfile: true, restrictedConfigReadback, filesystemIsolationTested: false, accountConfigured: !!account.account, modelTurnTested: false,

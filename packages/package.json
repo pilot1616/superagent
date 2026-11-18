@@ -10,9 +10,9 @@
   "bin": {
     "superagent-local": "dist/service/src/cli.js"
   },
-  "files": ["dist/core", "dist/storage", "dist/service", "dist/executor-codex/src", "dist/integrations-github", "dist/mcp", "dist/panel", "dist/LICENSE", "README.md"],
+  "files": ["dist/core", "dist/storage", "dist/service", "dist/executor-codex/src", "dist/executor-codex/protocol", "dist/integrations-gitlab", "dist/mcp", "dist/panel", "dist/LICENSE", "README.md"],
   "scripts": {
-    "build": "tsc -p tsconfig.json && tsc -p ../apps/panel/tsconfig.json && node scripts/build-panel.mjs",
+    "build": "node scripts/clean-build.mjs && tsc -p tsconfig.json && tsc -p ../apps/panel/tsconfig.json && node scripts/build-panel.mjs",
     "test": "node --test dist/tests/*.test.js",
     "check": "npm run build && npm test",
     "probe": "node dist/executor-codex/src/probe.js",

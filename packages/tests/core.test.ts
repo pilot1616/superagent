@@ -36,7 +36,7 @@ test('execution requires explicit approval; stopped tasks stay held across messa
     engine.receiveFeedback(created.id, 'ci:1', 'CI changed')
     engine.recover()
     assert.equal(stage(engine.require(created.id)), 'stopped')
-    assert.equal(engine.claim(store.effects('pending')[0]!), undefined)
+    assert.equal(store.effects('pending').filter(effect => effect.kind === 'launch').length, 0)
   } finally { store.close() }
 })
 test('late reports cannot modify a stopped task and uncertain work is not replayed', () => {

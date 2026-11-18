@@ -9,6 +9,43 @@ import { randomUUID } from 'node:crypto'
 import { Store } from '../storage/src/store.js'
 import { Engine } from '../core/src/engine.js'
 import type { Ticket } from '../core/src/model.js'
+import { candidates, scheduling } from '../core/src/scheduler.js'
+import type { Plan } from '../core/src/model.js'
+
+test('a crashed plan retains graph, grant, uncertain resource ownership and downstream blockers', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'sa-plan-crash-')), filename = join(root, 'tasks.sqlite')
+  const worker = `import {Store} from './dist/storage/src/store.js';
+import {Engine} from './dist/core/src/engine.js';
+const store=new Store(process.argv[1]);store.set('repository',{id:'repo'});
+const engine=new Engine(store,'human');
+const {plan,mapping}=engine.call('plan_create',{repositoryId:'repo',title:'Crash plan',tasks:[{key:'first',title:'First',request:'Do first',resources:['database']},{key:'last',title:'Integration',request:'Integrate'}],dependencies:[{before:'first',after:'last',condition:'artifact'}],integrationKey:'last',expiresAt:new Date(Date.now()+3600000).toISOString(),requestId:'create-plan-0001'});
+engine.call('plan_start',{planId:plan.id,expectedRevision:plan.revision,requestId:'start-plan-0001'});
+const approval=store.approvals(plan.id)[0];engine.approve(approval.id,true,approval.details.fingerprint);
+engine.claim(store.effects('pending').find(effect=>effect.ticketId===mapping.first));
+process.kill(process.pid,'SIGKILL');`
+  try {
+    await assert.rejects(() => promisify(execFile)(process.execPath, ['--input-type=module', '-e', worker, filename], { timeout: 10_000 }))
+    const store = new Store(filename)
+    try {
+      const engine = new Engine(store, 'human'), plan = store.entities<Plan>('plan')[0]!
+      assert.ok(plan.grant)
+      engine.recover()
+      const first = engine.require(plan.dependencies[0]!.before), last = engine.require(plan.integrationId)
+      assert.equal(scheduling(store, first).state, 'reconciling')
+      assert.equal(scheduling(store, last).state, 'waiting_dependencies')
+      assert.equal(candidates(store, new Set(), new Set(), 4).length, 0)
+      assert.equal(store.effects('uncertain').length, 1)
+      const newTicket = (engine.call('task_create', { repositoryId: 'repo', title: 'Resource competitor', request: 'Independent database work', requestId: randomUUID() }) as { ticket: Ticket }).ticket
+      newTicket.resources = ['database']; store.save(newTicket)
+      engine.call('task_start', { ticketId: newTicket.id, expectedRevision: newTicket.revision, requestId: randomUUID() })
+      engine.approve(store.approvals(newTicket.id)[0]!.id, true)
+      assert.equal(scheduling(store, engine.require(newTicket.id)).state, 'waiting_resources')
+      engine.reconcile(first.id, 'Verified killed fixture process and no external side effects', 'pending')
+      assert.equal(scheduling(store, engine.require(newTicket.id)).state, 'ready')
+      assert.equal(engine.require(first.id).mandate.humanHold, true)
+    } finally { store.close() }
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
 
 test('committed WAL state survives abrupt process exit and uncertain input is never replayed implicitly', async () => {
   const root = await mkdtemp(join(tmpdir(), 'sa-recover-'))
@@ -61,6 +98,7 @@ test('an effect is claimed once and ended assignments reject late callbacks', ()
     engine.updateExecution(ticket.id, running.assignments[0]!.id, current => { current.inputs[0]!.state = 'accepted' }, 'input.accepted')
     engine.report(ticket.id, running.assignments[0]!.id, { state: 'ready', summary: 'Done locally', checks: [] })
     assert.equal(engine.updateExecution(ticket.id, running.assignments[0]!.id, current => { current.failure = 'late callback' }, 'late'), false)
+    store.saveEffect({ ...store.effects('running')[0]!, state: 'done' })
     engine.complete(ticket.id)
     assert.equal(engine.require(ticket.id).ended, 'completed')
   } finally { store.close() }

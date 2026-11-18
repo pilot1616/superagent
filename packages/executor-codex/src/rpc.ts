@@ -1,6 +1,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { randomUUID } from 'node:crypto'
+import { setTimeout as delay } from 'node:timers/promises'
+import { ProcessTracker } from './processes.js'
 
 export interface RpcMessage {
   id?: string | number
@@ -10,16 +12,29 @@ export interface RpcMessage {
   error?: { code: number; message: string }
 }
 
+export class AppServerRpcError extends Error {
+  constructor(readonly code: number) { super(`App Server RPC error ${code}; inspect the local runtime without replaying uncertain work`) }
+}
+
 export class AppServer extends EventEmitter {
   readonly epoch = randomUUID()
   readonly child: ChildProcessWithoutNullStreams
+  readonly startedAt = new Date().toISOString()
+  readonly tracker?: ProcessTracker
+  private observationTimer?: NodeJS.Timeout
   private sequence = 0
   private buffer = ''
   private closed = false
+  private closing?: Promise<void>
   private pending = new Map<number, { resolve: (result: any) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>()
   constructor(command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv }) {
     super()
     this.child = spawn(command, args, { ...options, stdio: 'pipe', detached: process.platform !== 'win32' })
+    if (this.child.pid && process.platform !== 'win32') {
+      this.tracker = new ProcessTracker(this.child.pid)
+      this.observationTimer = setInterval(() => this.tracker?.sample(), 250)
+      this.observationTimer.unref()
+    }
     this.child.stdout.setEncoding('utf8')
     this.child.stdout.on('data', (chunk: string) => this.receive(chunk))
     this.child.stderr.setEncoding('utf8')
@@ -46,7 +61,7 @@ export class AppServer extends EventEmitter {
         if (!deferred) continue
         clearTimeout(deferred.timer)
         this.pending.delete(message.id)
-        if (message.error) deferred.reject(new Error(`App Server RPC error ${message.error.code}; inspect the local runtime without replaying uncertain work`))
+        if (message.error) deferred.reject(new AppServerRpcError(message.error.code))
         else deferred.resolve(message.result)
       }
     }
@@ -77,18 +92,31 @@ export class AppServer extends EventEmitter {
     this.emit('disconnected', error)
     void this.close().catch(() => undefined)
   }
-  async close(): Promise<void> {
-    if (!this.child.pid) return
-    if (this.child.exitCode !== null || this.child.signalCode !== null) return
-    const exited = new Promise<void>(resolve => this.child.once('exit', () => resolve()))
-    const terminate = (signal: NodeJS.Signals) => {
-      try {
-        if (process.platform !== 'win32' && this.child.pid) process.kill(-this.child.pid, signal)
-        else this.child.kill(signal)
-      } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error }
+  close(): Promise<void> {
+    return this.closing ??= Promise.resolve().then(() => this.terminateGroup()).finally(() => { clearInterval(this.observationTimer); this.closed = true; for (const deferred of this.pending.values()) { clearTimeout(deferred.timer); deferred.reject(new Error('App Server closed; never replay uncertain input')) }; this.pending.clear() })
+  }
+  private async terminateGroup(): Promise<void> {
+    const pid = this.child.pid
+    if (!pid) return
+    if (process.platform === 'win32') throw new Error('Process-tree termination is not verified on Windows; manual reconciliation required')
+    const present = () => {
+      try { process.kill(-pid, 0); return true }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false; if ((error as NodeJS.ErrnoException).code === 'EPERM') return !this.tracker?.groupAbsent(); throw error }
     }
-    terminate('SIGTERM')
-    const timer = setTimeout(() => terminate('SIGKILL'), 3_000)
-    await exited.finally(() => clearTimeout(timer))
+    const terminate = (signal: NodeJS.Signals) => {
+      try { process.kill(-pid, signal) }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error }
+    }
+    for (const signal of ['SIGTERM', 'SIGKILL'] as const) {
+      if (!present()) { this.tracker?.assertNoObservedEscape(); return }
+      this.tracker?.assertOwnedGroup()
+      terminate(signal)
+      const deadline = Date.now() + 3_000
+      do {
+        await delay(25)
+        if (!present()) { this.tracker?.assertNoObservedEscape(); return }
+      } while (Date.now() < deadline)
+    }
+    throw new Error('Owned process group did not disappear; keep the task in reconciliation')
   }
 }

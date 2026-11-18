@@ -1,15 +1,15 @@
 {
   "name": "superagent",
   "version": "0.1.0",
-  "description": "Manage manually authorized local coding tasks through an independent task service.",
+  "description": "Coordinate the current conversation project's tasks and dependencies through isolated local project services.",
   "author": {
     "name": "Local developer"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "Superagent",
-    "shortDescription": "Manage supervised local coding tasks.",
-    "longDescription": "Create and inspect tasks, request execution and publication, and preserve human stop and approval boundaries. Requires a separately started local service.",
+    "shortDescription": "Coordinate task graphs with human approval.",
+    "longDescription": "Select the current conversation project, then coordinate its task plans, dependencies and shared context. Concurrent projects use independent state and dashboards. Humans approve in the local dashboard or CLI; no default repository or automatic Worker authorization.",
     "developerName": "Local developer",
     "category": "Productivity",
     "capabilities": [],

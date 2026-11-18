@@ -1,56 +1,94 @@
 import React, { useEffect, useState, type FormEvent } from 'react'
 import { createRoot } from 'react-dom/client'
 import './panel.css'
+import { ApprovalPanel, EntityControls, WorkerDiagnostics, read } from './controls.js'
+import { DependencyGraph, statusLabel, taskStatus } from './graph.js'
+import { TaskDetail } from './task-detail.js'
+import { RuntimePanel, RuntimeQuestion } from './runtime.js'
 
-interface Envelope { ok: boolean; data?: any; error?: { message: string } }
-async function read(path: string): Promise<any> {
-  const response = await fetch(path, { credentials: 'same-origin' })
-  if (!response.ok) throw new Error(response.status === 401 ? '请先登录' : '本地服务暂不可用')
-  const result: Envelope = await response.json()
-  if (!result.ok) throw new Error(result.error?.message ?? '请求失败')
-  return result.data
-}
-function Panel() {
-  const [token, setToken] = useState('')
-  const [loggedIn, setLoggedIn] = useState(false)
+function useRead(path: string | undefined, version: number) {
+  const [value, setValue] = useState<any>()
   const [error, setError] = useState('')
-  const [health, setHealth] = useState<any>()
-  const [tasks, setTasks] = useState<any[]>([])
+  useEffect(() => {
+    if (!path) return
+    let disposed = false
+    setValue(undefined)
+    const refresh = async () => { try { const data = await read(path); if (!disposed) { setValue(data); setError('') } } catch (reason) { if (!disposed) setError(String(reason)) } }
+    void refresh(); const interval = setInterval(() => { void refresh() }, 5000)
+    return () => { disposed = true; clearInterval(interval) }
+  }, [path, version])
+  return { value, error }
+}
+
+function TaskList({ version, selected, onSelect }: { version: number; selected: string; onSelect(id: string): void }) {
+  const [view, setView] = useState('active')
+  const [query, setQuery] = useState('')
   const [cursor, setCursor] = useState(0)
-  const [nextCursor, setNextCursor] = useState<number | null>(null)
+  const { value: page, error } = useRead(`/api/tasks?view=${view}&query=${encodeURIComponent(query)}&cursor=${cursor}&limit=10`, version)
+  const filters = [['active', '未完成'], ['attention', '待我处理'], ['finished', '已结束'], ['all', '全部']]
+  return <section className="surface"><div className="section-heading"><h2>精简任务列表</h2><input aria-label="搜索任务名称" placeholder="搜索任务名称" value={query} onChange={event => { setQuery(event.target.value); setCursor(0) }} /></div>
+    <nav>{filters.map(([key, label]) => <button className={view === key ? 'selected' : ''} key={key} onClick={() => { setView(key); setCursor(0) }}>{label} {page?.counts[key] ?? '—'}</button>)}</nav>
+    {error && <p role="alert" className="error">{error}</p>}<ul className="compact-list">{page?.items.map((task: any) => <li key={task.id}><button className={selected === task.id ? 'selected' : ''} onClick={() => onSelect(task.id)}><strong>{task.title}</strong><span className="status">{taskStatus(task)}</span><small className="summary-line">{task.summary || '尚无阶段结论'}</small></button></li>)}</ul>
+    {page && !page.items.length && <p>该筛选下没有任务。任务通过 Codex 或 CLI 创建。</p>}<nav className="pager"><button disabled={!cursor} onClick={() => setCursor(Math.max(0, cursor - 10))}>上一页</button><small>共 {page?.total ?? '—'} 项 · 每页最多 10 项</small><button disabled={!page || page.nextCursor === null} onClick={() => setCursor(page.nextCursor)}>下一页</button></nav>
+  </section>
+}
+
+function PlanList({ version, selectedTask, onSelectTask, onChange }: { version: number; selectedTask: string; onSelectTask(id: string): void; onChange(): void }) {
+  const [cursor, setCursor] = useState(0)
   const [selected, setSelected] = useState('')
-  const [detail, setDetail] = useState<any>()
+  const { value: page, error } = useRead(`/api/plans?cursor=${cursor}&limit=10`, version)
+  const active = selected || page?.items[0]?.id || ''
+  const { value: detail, error: detailError } = useRead(active ? `/api/plans/${active}` : undefined, version)
+  return <section><h2>计划总览与任务依赖</h2>{(error || detailError) && <p role="alert" className="error">{error || detailError}</p>}
+    <div className="columns plan-columns"><div><ul className="compact-list">{page?.items.map((plan: any) => <li key={plan.id}><button className={active === plan.id ? 'selected' : ''} onClick={() => { setSelected(plan.id); onSelectTask('') }}><strong>{plan.title}</strong><small>{plan.completed ? '整体验收完成' : plan.held ? '整组停止' : plan.paused ? '暂停派发' : '任务计划'} · {plan.ticketIds.length} 个节点</small></button></li>)}</ul>{page && !page.items.length && <p>尚无关联任务计划。先让 Codex 根据需求建立任务依赖计划；独立任务可在“任务”页查看。</p>}<nav className="pager"><button disabled={!cursor} onClick={() => { setCursor(Math.max(0, cursor - 10)); setSelected(''); onSelectTask('') }}>上一页</button><button disabled={!page || page.nextCursor === null} onClick={() => { setCursor(page.nextCursor); setSelected(''); onSelectTask('') }}>下一页</button></nav></div>
+      <div>{detail?.plan?.id === active ? <><div className="section-heading"><h3>{detail.plan.title}</h3><span className="badge">{statusLabel(detail.outcome)}</span></div><p>已验收 {detail.acceptedResults} / {detail.requiredResults} · 图版本 {detail.plan.version} · 部分验收不等于完成</p><div className="status-counts">{Object.entries(detail.counts).map(([state, count]) => <span className="badge" key={state}>{statusLabel(state)} {String(count)}</span>)}</div><DependencyGraph detail={detail} selected={selectedTask} onSelect={onSelectTask} />
+        <details><summary>计划控制、授权与预算</summary><p>最多 {detail.plan.maxAttempts} 次执行分配 / 节点 · 到期 {new Date(detail.plan.expiresAt).toLocaleString()}</p><EntityControls kind="plan" record={detail.plan} onChange={onChange} /><pre>{JSON.stringify({ grant: detail.plan.grant, approvals: detail.approvals }, null, 2)}</pre></details></> : <p>选择计划查看依赖图；点击图中的任务查看阶段结论。</p>}</div></div>
+  </section>
+}
+
+function ContextList({ version }: { version: number }) {
+  const [cursor, setCursor] = useState(0)
   const [eventCursor, setEventCursor] = useState(0)
+  const [selected, setSelected] = useState('')
+  const { value: page, error } = useRead(`/api/threads?cursor=${cursor}&limit=10`, version)
+  const { value: detail, error: detailError } = useRead(selected ? `/api/threads/${selected}?cursor=${eventCursor}` : undefined, version)
+  return <section className="surface"><h2>共享上下文与路由</h2><p>上下文关联不隐式授予任务权限。</p>{(error || detailError) && <p className="error" role="alert">{error || detailError}</p>}<ul>{page?.items.map((item: any) => <li key={item.id}><button onClick={() => { setSelected(item.id); setEventCursor(0) }}>{item.title}</button></li>)}</ul><nav><button disabled={!cursor} onClick={() => setCursor(Math.max(0, cursor - 10))}>上一页</button><button disabled={!page || page.nextCursor === null} onClick={() => setCursor(page.nextCursor)}>下一页</button></nav>{detail?.thread.id === selected && <details open><summary>{detail.thread.title}</summary><pre>{JSON.stringify(detail, null, 2)}</pre><nav><button disabled={!eventCursor} onClick={() => setEventCursor(0)}>首批事件</button><button disabled={detail.nextCursor === null} onClick={() => setEventCursor(detail.nextCursor)}>后续事件</button></nav></details>}</section>
+}
+
+function Panel() {
+  const [loggedIn, setLoggedIn] = useState(false)
+  const [token, setToken] = useState('')
+  const [loginError, setLoginError] = useState('')
+  const [loggingIn, setLoggingIn] = useState(false)
+  useEffect(() => { const expired = () => { setLoggedIn(false); setLoginError('登录已过期，请重新登录。') }; window.addEventListener('superagent-session-expired', expired); return () => window.removeEventListener('superagent-session-expired', expired) }, [])
+  const [version, setVersion] = useState(0)
+  const [tab, setTab] = useState('plans')
+  const [selected, setSelected] = useState('')
+  const { value: health, error } = useRead(loggedIn ? '/api/health' : undefined, version)
+  const { value: approvals } = useRead(loggedIn ? '/api/approvals' : undefined, version)
+  const changed = () => setVersion(current => current + 1)
   async function login(event: FormEvent) {
     event.preventDefault()
-    const response = await fetch('/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token }) })
-    setToken('')
-    if (response.ok) { setLoggedIn(true); setError('') } else setError('登录失败，请使用当前终端显示的令牌')
+    if (loggingIn) return
+    setLoggingIn(true)
+    try {
+      const response = await fetch('/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token }) })
+      setToken('')
+      if (!response.ok) throw new Error(response.status === 401 ? '令牌不匹配，请在可信终端查看当前项目令牌。' : response.status === 403 ? '请求来源校验失败，请刷新本项目控制台。' : response.status === 429 ? '尝试过多，请一分钟后重试。' : '服务不可用，请检查连接。')
+      setLoggedIn(true); setLoginError('')
+    } catch (reason) { setLoginError(String(reason)) } finally { setLoggingIn(false) }
   }
-  useEffect(() => {
-    if (!loggedIn) return
-    let disposed = false
-    const refresh = async () => {
-      try {
-        const [status, page, task] = await Promise.all([read('/api/health'), read(`/api/tasks?cursor=${cursor}`), selected ? read(`/api/tasks/${selected}?cursor=${eventCursor}`) : undefined])
-        if (!disposed) { setHealth(status); setTasks(page.items); setNextCursor(page.nextCursor); setDetail(task); setError('') }
-      } catch (reason) { if (!disposed) setError(reason instanceof Error ? reason.message : '读取失败') }
-    }
-    void refresh()
-    const interval = setInterval(() => { void refresh() }, 5000)
-    return () => { disposed = true; clearInterval(interval) }
-  }, [loggedIn, cursor, selected, eventCursor])
-  return <main>
-    <header><div><small>LOCAL TASK CONTROL</small><h1>Superagent</h1></div><span className="badge">只读监督看板</span></header>
-    <p className="notice">执行、发布和权限审批请使用可信终端。这里不会自动启动 Worker、推送代码或批准操作。</p>
-    {error && <p role="alert" className="error">{error}</p>}
-    {!loggedIn ? <form onSubmit={login}><h2>本地登录</h2><label htmlFor="token">从启动看板的终端复制登录令牌</label><input id="token" type="password" autoComplete="off" value={token} onChange={event => setToken(event.target.value)} required /><button>登录</button></form> : <>
-      <section className="metrics"><article><small>调度</small><strong>{health?.paused ? '已暂停派发' : '接收任务'}</strong></article><article><small>Worker</small><strong>{health?.activeWorkers ?? '未知'}</strong></article><article><small>待处理副作用</small><strong>{health?.pendingEffects ?? '未知'}</strong></article><article><small>真实执行验收</small><strong>{health?.executionEnabled ? '通过' : '未通过 · 已禁用'}</strong></article></section>
-      <section className="columns"><div><h2>任务列表</h2><ul>{tasks.map(task => <li key={task.id}><button className={selected === task.id ? 'selected' : ''} onClick={() => { setSelected(task.id); setEventCursor(0) }}><strong>{task.title}</strong><span>{task.stage} · r{task.revision}</span><small>{task.id}</small></button></li>)}</ul>{tasks.length === 0 && <p>没有任务。通过 Codex 工具或本地 CLI 明确建单。</p>}<nav><button disabled={cursor === 0} onClick={() => setCursor(Math.max(0, cursor - 50))}>上一页</button><button disabled={nextCursor === null} onClick={() => setCursor(nextCursor!)}>下一页</button></nav></div>
-      <div><h2>任务详情与审计</h2>{detail ? <><p><strong>{detail.ticket.title}</strong> · {detail.stage}</p><h3>任务范围</h3><pre>{detail.ticket.scope}</pre><h3>状态与人工待办</h3><pre>{JSON.stringify({ humanHold: detail.ticket.mandate.humanHold, report: detail.ticket.report, reconciliation: detail.ticket.reconciliation, failure: detail.ticket.failure, pull: detail.ticket.pull, approvals: detail.approvals }, null, 2)}</pre><h3>输入与执行记录</h3><pre>{JSON.stringify({ inputs: detail.ticket.inputs, assignments: detail.ticket.assignments, binding: detail.ticket.binding }, null, 2)}</pre><h3>审计事件</h3><pre>{JSON.stringify(detail.events, null, 2)}</pre><nav><button disabled={eventCursor === 0} onClick={() => setEventCursor(0)}>首批事件</button><button disabled={detail.events.length < 50} onClick={() => setEventCursor(detail.events.at(-1).sequence)}>后续事件</button></nav></> : <p>选择任务查看状态、PR、输入、审批与事件。</p>}</div></section>
+  return <main><header><div><small>LOCAL TASK CONTROL</small><h1>Superagent</h1></div><span className="badge">人工任务控制台</span></header>
+    {(loginError || error) && <p role="alert" className="error">{loginError || error}</p>}
+    {!loggedIn ? <form onSubmit={login}><h2>本地登录</h2><label htmlFor="token">在可信终端读取该项目的登录令牌，不要发给模型。</label><input id="token" type="password" autoComplete="off" value={token} onChange={event => setToken(event.target.value)} required /><button disabled={loggingIn}>{loggingIn ? '登录中' : '登录'}</button></form> : <>
+      <p>当前项目：<code>{health?.repository?.path ?? '读取中'}</code></p><div className="metrics"><article><small>调度</small><strong>{health?.paused ? '暂停派发' : '接收任务'}</strong></article><article><small>运行 Worker</small><strong>{health?.activeWorkers ?? '—'}</strong></article><article><small>执行环境</small><strong>{health?.executionEnabled ? '已验收' : '尚未验收'}</strong></article></div>
+      <RuntimePanel runtime={health?.runtime} repositoryId={health?.repository?.id} onChange={changed} />
+      {approvals?.filter((approval: any) => approval.details.method === 'item/tool/requestUserInput').map((approval: any) => <RuntimeQuestion key={approval.id} approval={approval} repositoryId={health?.repository?.id} onChange={changed} />)}
+      <nav className="tabs">{[['plans', '计划与依赖'], ['tasks', '任务'], ['approvals', '审批中心'], ['context', '共享上下文']].map(([key, label]) => <button key={key} className={tab === key ? 'selected' : ''} onClick={() => { setTab(key); setSelected('') }}>{label}</button>)}<button onClick={changed}>刷新</button></nav>
+      {tab === 'plans' && <PlanList version={version} selectedTask={selected} onSelectTask={setSelected} onChange={changed} />}{tab === 'tasks' && <TaskList version={version} selected={selected} onSelect={setSelected} />}{tab === 'approvals' && <ApprovalPanel onChange={changed} />}{tab === 'context' && <ContextList version={version} />}
+      {selected && ['plans', 'tasks'].includes(tab) && <TaskDetail key={selected} ticketId={selected} refreshVersion={version} onChange={changed} onClose={() => setSelected('')} />}
       <details><summary>服务健康与兼容性</summary><pre>{JSON.stringify(health, null, 2)}</pre></details>
-    </>}
-    <footer>单用户 · 单仓库 · 本地持久化。真实模型执行会将必要任务与代码上下文发送给模型供应商。</footer>
+    </>}<footer>按项目隔离 · 任务启动与发布分别审批 · 不自动合并 MR。真实执行会将必要任务与代码上下文发送给模型供应商。</footer>
   </main>
 }
 createRoot(document.getElementById('root')!).render(<Panel />)

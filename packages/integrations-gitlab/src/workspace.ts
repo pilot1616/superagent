@@ -3,6 +3,7 @@ import { promisify } from 'node:util'
 import { mkdtemp, lstat, rm, realpath, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { requireCondition, type PublishPreview, type Repository, type Ticket } from '../../core/src/model.js'
+import { validateGitLabProject } from '../../core/src/gitlab.js'
 import { digest } from '../../storage/src/store.js'
 import { inside, inspectWorkspace } from '../../service/src/workspace.js'
 
@@ -14,8 +15,9 @@ export async function deliveryGit(directory: string, args: string[], extra: Node
   } catch { throw new Error('Controlled Git operation failed; inspect local and remote state before retrying') }
 }
 async function checkRepository(repository: Repository, ticket: Ticket): Promise<void> {
-  requireCondition(repository.github && ticket.workspace && ticket.branch && ticket.baseSha, 'INVALID_STATE', 'GitHub repository and managed workspace are required')
-  requireCondition(!['HEAD', 'FETCH_HEAD'].includes(repository.baseRef) && !repository.baseRef.startsWith('refs/'), 'INVALID_STATE', 'Register a named GitHub base branch, such as main, before publishing')
+  requireCondition(repository.gitlab && ticket.workspace && ticket.branch && ticket.baseSha, 'INVALID_STATE', 'GitLab repository and managed workspace are required')
+  validateGitLabProject(repository.gitlab)
+  requireCondition(!['HEAD', 'FETCH_HEAD'].includes(repository.baseRef) && !repository.baseRef.startsWith('refs/'), 'INVALID_STATE', 'Register a named GitLab base branch, such as main, before publishing')
   requireCondition(await realpath(ticket.workspace) === join(await realpath(repository.executionRoot), ticket.id), 'FORBIDDEN', 'Workspace does not match its registered root')
   const configuration = await deliveryGit(ticket.workspace, ['config', '--local', '--list'])
   requireCondition(!/^(?:filter\.|url\.|include\.|includeif\.|credential\.|http\.|core\.(?:sshcommand|gitproxy|attributesfile|fsmonitor)|extensions\.worktreeconfig)/im.test(configuration), 'FORBIDDEN', 'Unsafe or unsupported local Git configuration; publication requires manual review')
@@ -44,7 +46,7 @@ export async function previewWorkspace(repository: Repository, ticket: Ticket, s
     await deliveryGit(ticket.workspace!, ['add', '-A', '--', '.'], env)
     const treeSha = await deliveryGit(ticket.workspace!, ['write-tree'], env)
     const diff = await deliveryGit(ticket.workspace!, ['diff', '--no-ext-diff', '--no-textconv', '--stat', ticket.baseSha!, treeSha])
-    const content = { ticketId: ticket.id, revision: ticket.revision, repository: repository.github!, branch: ticket.branch!, baseRef: repository.baseRef, baseSha: ticket.baseSha!, headSha: inspected.headSha, treeSha, diff, title: ticket.title, body: `Task: ${ticket.id}\n\n${ticket.report?.summary ?? ''}\n\nChecks reported by Worker (not independently verified):\n${ticket.report?.checks.map(check => `- ${check}`).join('\n') ?? ''}`, authorName, authorEmail }
+    const content = { provider: 'gitlab' as const, ticketId: ticket.id, revision: ticket.revision, repository: repository.gitlab!, branch: ticket.branch!, baseRef: repository.baseRef, baseSha: ticket.baseSha!, headSha: inspected.headSha, treeSha, diff, title: ticket.title, body: `Task: ${ticket.id}\n\n${ticket.report?.summary ?? ''}\n\nChecks reported by Worker (not independently verified):\n${ticket.report?.checks.map(check => `- ${check}`).join('\n') ?? ''}`, authorName, authorEmail }
     return { ...content, fingerprint: digest(content) }
   } finally { await rm(temp, { recursive: true, force: true }) }
 }
@@ -57,7 +59,10 @@ export async function commitPreview(ticket: Ticket, preview: PublishPreview): Pr
   await deliveryGit(ticket.workspace!, ['read-tree', commit])
   return commit
 }
-export async function pushCommit(ticket: Ticket, preview: PublishPreview, commit: string, token: string): Promise<void> {
-  const authorization = Buffer.from(`x-access-token:${token}`).toString('base64')
-  await deliveryGit(ticket.workspace!, ['push', '--porcelain', `https://github.com/${preview.repository}.git`, `${commit}:refs/heads/${preview.branch}`], { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader', GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${authorization}` })
+export async function pushCommit(ticket: Ticket, preview: PublishPreview, commit: string, token: string, executeGit: typeof deliveryGit = deliveryGit): Promise<void> {
+  requireCondition(preview.provider === 'gitlab', 'FORBIDDEN', 'Only GitLab publication is supported')
+  validateGitLabProject(preview.repository)
+  const remote = `${preview.repository.url}/${preview.repository.projectPath}.git`
+  const authorization = Buffer.from(`oauth2:${token}`).toString('base64')
+  await executeGit(ticket.workspace!, ['push', '--porcelain', remote, `${commit}:refs/heads/${preview.branch}`], { GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_1: 'http.followRedirects', GIT_CONFIG_VALUE_1: 'false', GIT_CONFIG_KEY_0: `http.${remote}.extraheader`, GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${authorization}` })
 }

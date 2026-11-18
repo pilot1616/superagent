@@ -1,9 +1,22 @@
-import type { Approval, Audit, Effect, Repository, Ticket } from './model.js'
+import type { Approval, Assignment, Audit, Effect, Repository, Ticket } from './model.js'
+
+export interface ExecutionPermit { readonly assignmentId: string; readonly ticketId: string; readonly fingerprint: string; readonly fence: number; readonly enablementId: string; readonly executable: string }
+export interface RuntimeGate {
+  blocker(): { reason: string; reasonCodes: string[] } | undefined
+  bind(ticket: Ticket, assignment: Assignment): void
+  permit(ticket: Ticket): ExecutionPermit
+  validate(permit: ExecutionPermit): void
+  quarantine(reasonCode: string, assignmentIds: string[]): void
+  invalidate?(reasonCode: string): void
+}
 
 export interface Persistence {
   atomic<Result>(operation: () => Result): Result
   get<Result>(key: string): Result | undefined
   set(key: string, value: unknown): void
+  entity<Result>(kind: string, id: string): Result | undefined
+  entities<Result>(kind: string): Result[]
+  saveEntity(kind: string, id: string, value: unknown): void
   repository(): Repository | undefined
   ticket(id: string): Ticket | undefined
   tickets(): Ticket[]
@@ -25,5 +38,6 @@ export interface Executor {
   launch(ticket: Ticket): Promise<void>
   stop(ticketId: string): Promise<void>
   decideRuntime(id: string, accept: boolean): Promise<void>
+  answerRuntime?(id: string, answers: Record<string, { answers: string[] }>): Promise<void>
   shutdown(): Promise<void>
 }

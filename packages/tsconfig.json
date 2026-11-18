@@ -12,5 +12,5 @@
     "types": ["node"],
     "declaration": true
   },
-  "include": ["core/**/*.ts", "storage/**/*.ts", "executor-codex/**/*.ts", "service/**/*.ts", "integrations-github/**/*.ts", "mcp/**/*.ts", "tests/**/*.ts"]
+  "include": ["core/**/*.ts", "storage/**/*.ts", "executor-codex/**/*.ts", "service/**/*.ts", "integrations-gitlab/**/*.ts", "mcp/**/*.ts", "tests/**/*.ts"]
 }

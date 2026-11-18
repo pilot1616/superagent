@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite'
-import { chmodSync, mkdirSync } from 'node:fs'
+import { chmodSync, mkdirSync, existsSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { createHash } from 'node:crypto'
 import { DomainError, type Approval, type Audit, type Effect, type Repository, type Ticket } from '../../core/src/model.js'
@@ -16,7 +16,11 @@ export class Store {
     try {
       this.db.exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;')
       const version = (this.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version
-      if (version > 1) throw new Error(`Unsupported database schema ${version}; restore a compatible backup`)
+      if (version > 2) throw new Error(`Unsupported database schema ${version}; restore a compatible backup`)
+      if (version === 1 && filename !== ':memory:') {
+        const destination = `${filename}.before-v2.sqlite`
+        if (!existsSync(destination)) { this.db.exec(`VACUUM INTO '${destination.replaceAll("'", "''")}'`); chmodSync(destination, 0o600) }
+      }
       this.atomic(() => this.db.exec(`
         CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS ticket (id TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -27,7 +31,8 @@ export class Store {
         CREATE TABLE IF NOT EXISTS audit (sequence INTEGER PRIMARY KEY AUTOINCREMENT, ticket_id TEXT NOT NULL, event TEXT NOT NULL, detail TEXT NOT NULL, at TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS audit_ticket ON audit(ticket_id,sequence);
         CREATE TABLE IF NOT EXISTS observed (key TEXT PRIMARY KEY);
-        PRAGMA user_version=1;
+        CREATE TABLE IF NOT EXISTS entity (kind TEXT NOT NULL, id TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(kind,id));
+        PRAGMA user_version=2;
       `))
       if (filename !== ':memory:') chmodSync(filename, 0o600)
     } catch (error) { this.db.close(); throw error }
@@ -41,6 +46,9 @@ export class Store {
   }
   get<Result>(key: string): Result | undefined { return parse(this.db.prepare('SELECT value FROM metadata WHERE key=?').get(key)) }
   set(key: string, value: unknown): void { this.db.prepare('INSERT INTO metadata VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, JSON.stringify(value)) }
+  entity<Result>(kind: string, id: string): Result | undefined { return parse(this.db.prepare('SELECT value FROM entity WHERE kind=? AND id=?').get(kind, id)) }
+  entities<Result>(kind: string): Result[] { return this.db.prepare('SELECT value FROM entity WHERE kind=? ORDER BY rowid').all(kind).map(row => parse<Result>(row)!) }
+  saveEntity(kind: string, id: string, value: unknown): void { this.db.prepare('INSERT INTO entity VALUES (?,?,?) ON CONFLICT(kind,id) DO UPDATE SET value=excluded.value').run(kind, id, JSON.stringify(value)) }
   repository(): Repository | undefined { return this.get('repository') }
   ticket(id: string): Ticket | undefined { return parse(this.db.prepare('SELECT value FROM ticket WHERE id=?').get(id)) }
   tickets(): Ticket[] { return this.db.prepare('SELECT value FROM ticket ORDER BY rowid DESC').all().map(row => parse<Ticket>(row)!) }

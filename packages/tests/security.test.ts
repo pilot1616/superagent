@@ -14,7 +14,9 @@ import { CodexExecutor } from '../executor-codex/src/executor.js'
 import { executionVerified } from '../executor-codex/src/acceptance.js'
 import { createProfile, loadProfile, workerEnvironment } from '../executor-codex/src/profile.js'
 import { startPanel } from '../service/src/panel.js'
-import { acquireLock } from '../service/src/config.js'
+import { acquireLock, initialize } from '../service/src/config.js'
+import { startService } from '../service/src/daemon.js'
+import { git } from '../service/src/workspace.js'
 
 function taskFixture() {
   const store = new Store(':memory:')
@@ -42,7 +44,7 @@ test('real Worker gate fails before worktree preparation or process creation', a
   try {
     assert.equal(executionVerified(), false)
     const executor = new CodexExecutor(store, engine, '/state-that-does-not-exist', 'binary-that-does-not-exist')
-    await assert.rejects(() => executor.launch(ticket), /P0 runtime acceptance/)
+    await assert.rejects(() => executor.launch(ticket), { code: 'RUNTIME_ENABLEMENT_REQUIRED' })
     assert.equal(executor.active.size, 0)
     assert.equal(engine.require(ticket.id).workspace, undefined)
   } finally { store.close() }
@@ -63,6 +65,14 @@ test('administrative approvals reject noninteractive model shell calls', async (
     return true
   })
 })
+test('result and whole-plan acceptance require interactive human confirmation', async () => {
+  for (const command of ['accept-result', 'complete-plan']) {
+    await assert.rejects(() => promisify(execFile)(process.execPath, ['dist/service/src/cli.js', command, '--json', JSON.stringify({ ticketId: 'task', planId: 'plan', expectedRevision: 1, kind: 'artifact', content: 'Not human approval' })], { timeout: 5000 }), error => {
+      assert.match(String((error as { stderr: string }).stderr), /interactive terminal/)
+      return true
+    })
+  }
+})
 test('lock ownership changes are detected without deleting another owner', async () => {
   const root = await mkdtemp(join(tmpdir(), 'sa-lock-'))
   try {
@@ -74,8 +84,14 @@ test('lock ownership changes are detected without deleting another owner', async
     assert.equal(JSON.parse(await readFile(join(root, 'daemon.lock/owner.json'), 'utf8')).owner, 'replacement')
   } finally { await rm(root, { recursive: true, force: true }) }
 })
-test('panel binds loopback, validates origin and host, and exposes no mutation API', async () => {
-  const panel = await startPanel('/missing-service')
+test('panel binds loopback, validates origin and host, and exposes no generic admin API', async () => {
+  const root = await realpath(await mkdtemp('/tmp/sa-security-panel-'))
+  const state = join(root, 's'), repo = join(root, 'r')
+  await git(root, ['init', repo]); await writeFile(join(repo, 'README'), 'fixture')
+  await git(repo, ['add', 'README']); await git(repo, ['-c', 'user.name=Test', '-c', 'user.email=test@invalid', 'commit', '-m', 'fixture'])
+  await initialize(state, repo, join(root, 'w'), 'test-model')
+  const service = await startService(state)
+  const panel = await startPanel(state)
   try {
     const page = await fetch(panel.origin)
     assert.equal(page.status, 200)
@@ -88,7 +104,7 @@ test('panel binds loopback, validates origin and host, and exposes no mutation A
     assert.equal(login.status, 200)
     assert.match(login.headers.get('set-cookie')!, /HttpOnly; SameSite=Strict/)
     const cookie = login.headers.get('set-cookie')!.split(';')[0]!
-    assert.equal((await fetch(`${panel.origin}/api/decide`, { method: 'POST', headers: { cookie, origin: panel.origin } })).status, 405)
+    assert.equal((await fetch(`${panel.origin}/api/decide`, { method: 'POST', headers: { cookie, origin: panel.origin } })).status, 403)
     assert.equal((await fetch(`${panel.origin}/api/admin`, { headers: { cookie } })).status, 404)
-  } finally { await panel.close() }
+  } finally { await panel.close(); await service.close(); await rm(root, { recursive: true, force: true }) }
 })
