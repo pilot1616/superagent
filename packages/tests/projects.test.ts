@@ -53,7 +53,10 @@ test('two session bridges isolate current projects and never default to an impor
   try {
     assert.equal((await first.call('health')).error.code, 'PROJECT_REQUIRED')
     const tools = await first.client.listTools()
-    assert.equal(tools.tools.length, 28)
+    assert.equal(tools.tools.length, 30)
+    assert.ok(tools.tools.some(tool => tool.name === 'superagent_plan_workspace_preview'))
+    assert.ok(tools.tools.some(tool => tool.name === 'superagent_task_workspace_prepare'))
+    assert.equal(tools.tools.some(tool => /workspace.configure/.test(tool.name)), false)
     assert.equal(tools.tools.some(tool => /approve|decide/.test(tool.name)), false)
     await first.call('project_open', { repositoryPath: context.first })
     await second.call('project_open', { repositoryPath: context.second })

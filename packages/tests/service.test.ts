@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm, writeFile, readFile, realpath } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile, readFile, realpath, mkdir, symlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -43,7 +43,7 @@ test('real daemon keeps approved tasks pending before environment checks and hum
   } finally { await service?.close(); await rm(root, { recursive: true, force: true }) }
 })
 
-test('real Codex Worker dispatch reaches only a loopback fixture provider without verification evidence', { timeout: 25000 }, async () => {
+test('real Codex Worker with repository-linked skills reaches only a loopback fixture provider without verification evidence', { timeout: 25000 }, async () => {
   const root = await realpath(await mkdtemp('/tmp/sa-dispatch-'))
   const state = join(root, 's'), repository = join(root, 'r')
   const requests: { url?: string; body: string }[] = []
@@ -61,7 +61,11 @@ test('real Codex Worker dispatch reaches only a loopback fixture provider withou
   let service: Awaited<ReturnType<typeof startService>> | undefined
   try {
     await git(root, ['init', repository]); await writeFile(join(repository, 'README'), 'Local dispatch fixture\n')
-    await git(repository, ['add', 'README']); await git(repository, ['-c', 'user.name=Test', '-c', 'user.email=test@invalid', 'commit', '-m', 'fixture'])
+    await mkdir(join(repository, '.agents'))
+    await mkdir(join(repository, 'skills/fixture'), { recursive: true })
+    await writeFile(join(repository, 'skills/fixture/SKILL.md'), '---\nname: fixture\ndescription: Synthetic local fixture only\n---\nRepository skill data, not execution authority.\n')
+    await symlink('../skills', join(repository, '.agents/skills'))
+    await git(repository, ['add', 'README', '.agents', 'skills']); await git(repository, ['-c', 'user.name=Test', '-c', 'user.email=test@invalid', 'commit', '-m', 'fixture'])
     await initialize(state, repository, join(root, 'w'), 'not-a-real-model')
     await createProfile(state, 'not-a-real-model', { id: 'fixture', authMode: 'none', baseUrl: `http://127.0.0.1:${address.port}/v1` })
     service = await startService(state)
@@ -81,10 +85,47 @@ test('real Codex Worker dispatch reaches only a loopback fixture provider withou
     assert.equal(JSON.parse(request.body).model, 'not-a-real-model')
     assert.ok(current.workspace?.startsWith(join(root, 'w')))
     assert.ok(current.binding?.threadId)
+    assert.equal(await git(repository, ['status', '--porcelain=v1']), '')
     assert.equal((await loadProfile(state)).model, 'not-a-real-model')
     assert.equal(service.store.entities('runtime_verification').length, 0)
     assert.equal(service.runtime.status().verificationPassed, false)
   } finally { await service?.close(); provider.closeAllConnections(); await new Promise<void>(resolve => provider.close(() => resolve())); await rm(root, { recursive: true, force: true }) }
+})
+
+test('a workspace stays bound to its task when project execution configuration blocks preflight', { timeout: 15000 }, async () => {
+  const root = await realpath(await mkdtemp('/tmp/sa-preflight-'))
+  const state = join(root, 's'), repository = join(root, 'r')
+  let service: Awaited<ReturnType<typeof startService>> | undefined
+  try {
+    await git(root, ['init', repository])
+    await mkdir(join(repository, '.codex'))
+    await writeFile(join(repository, '.codex/config.toml'), 'model = "not-execution-authority"\n')
+    await git(repository, ['add', '.'])
+    await git(repository, ['-c', 'user.name=Test', '-c', 'user.email=test@invalid', 'commit', '-m', 'fixture'])
+    await initialize(state, repository, join(root, 'w'), 'not-a-real-model')
+    await createProfile(state, 'not-a-real-model', { id: 'fixture', authMode: 'none', baseUrl: 'http://127.0.0.1:9/v1' })
+    service = await startService(state)
+    await service.runtime.check()
+    const repositoryId = service.store.repository()!.id
+    const { ticket } = service.engine.call('task_create', { repositoryId, title: 'Preflight rejection', request: 'Never launch a model turn', requestId: randomUUID() }) as { ticket: Ticket }
+    service.engine.call('task_start', { ticketId: ticket.id, expectedRevision: ticket.revision, requestId: randomUUID() })
+    service.engine.approve(service.store.approvals(ticket.id)[0]!.id, true)
+    const preview = service.runtime.preview('enable', { repositoryId, expectedRevision: service.runtime.state().revision })
+    service.runtime.enable({ requestId: randomUUID(), expectedRevision: preview.expectedRevision, repositoryId, confirmation: repositoryId, reviewId: preview.reviewId, mode: 'restricted_local', expectedFingerprint: preview.expectedFingerprint, reason: 'Disposable preflight regression only' })
+    await waitFor(() => service!.engine.view(service!.engine.require(ticket.id)).scheduling.state === 'waiting_workspace')
+    const current = service.engine.require(ticket.id)
+    assert.match(service.engine.view(current).scheduling.reasons.join(' '), /checkout contains \.codex/)
+    assert.equal(current.failure, undefined)
+    assert.equal(current.assignments.at(-1)!.startedAt, undefined)
+    assert.equal(service.store.effects().find(effect => effect.ticketId === ticket.id)!.attempts, 0)
+    assert.equal(current.workspace, join(root, 'w', ticket.id))
+    assert.equal(current.branch, `superagent/${ticket.id}`)
+    assert.equal(current.baseSha, service.store.repository()!.baseSha)
+    assert.equal(current.binding, undefined)
+    assert.equal(service.executor.active.size, 0)
+    assert.equal(service.store.get(`process:${ticket.id}`), undefined)
+    assert.deepEqual(await prepareWorkspace(service.store.repository()!, current), { workspace: current.workspace, branch: current.branch, baseSha: current.baseSha })
+  } finally { await service?.close(); await rm(root, { recursive: true, force: true }) }
 })
 
 test('authenticated service, MCP transport, concurrency, backup and restart preserve manual holds', async () => {

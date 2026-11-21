@@ -18,7 +18,7 @@ async function eventually(check: () => boolean) {
   assert.ok(check(), 'Timed out waiting for local service')
 }
 
-test('real daemon dispatches parallel roots then integration, guards admin acceptance, and persists the graph', async () => {
+test('real daemon automatically hands off parallel roots, guards final acceptance, and persists the goal', async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'sa-graph-'))), state = join(root, 's'), repo = join(root, 'r')
   await git(root, ['init', '-b', 'main', repo])
   await writeFile(join(repo, 'README'), 'fixture\n')
@@ -73,13 +73,13 @@ test('real daemon dispatches parallel roots then integration, guards admin accep
       await finish(id)
       const acceptance = { ticketId: id, expectedRevision: engine!.require(id).revision, kind: 'artifact', content: `Reviewed ${key}` }
       assert.equal((await invoke(state, 'bridge', 'accept-result', acceptance)).error?.code, 'FORBIDDEN')
-      assert.equal((await invoke(state, 'admin', 'accept-result', acceptance)).ok, true)
+      await eventually(() => engine!.require(id).result?.acceptedBy === 'coordinator')
     }
     await eventually(() => active.has(mapping.integration!))
     assert.equal(latestAssignment(engine!.require(mapping.integration!))!.inputs!.length, 2)
     await finish(mapping.integration!)
     assert.equal((await invoke(state, 'admin', 'accept-result', { ticketId: mapping.integration, expectedRevision: engine!.require(mapping.integration!).revision, kind: 'artifact', content: 'Integration checks reviewed' })).ok, true)
-    assert.equal((await invoke(state, 'admin', 'complete-plan', { planId: plan.id, expectedRevision: service.store.entity<Plan>('plan', plan.id)!.revision })).ok, true)
+    assert.equal(service.store.entity<Plan>('plan', plan.id)!.completed, true)
     assert.equal(launches.length, 3)
     assert.ok(service.store.events(mapping.integration!).some(event => event.event === 'scheduler.decision'))
     await invoke(state, 'admin', 'backup')

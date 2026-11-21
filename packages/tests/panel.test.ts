@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtemp, realpath, writeFile, readFile, rm, stat, symlink } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { tmpdir, homedir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { initialize } from '../service/src/config.js'
@@ -10,10 +10,13 @@ import { startPanel } from '../service/src/panel.js'
 import { writePanelToken } from '../service/src/panel-token.js'
 import { invoke } from '../service/src/ipc.js'
 import { git } from '../service/src/workspace.js'
-import type { Approval, Plan } from '../core/src/model.js'
+import { latestAssignment, type Approval, type Plan } from '../core/src/model.js'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import { fileURLToPath } from 'node:url'
 
-async function fixture(synthetic = false) {
-  const root = await realpath(await mkdtemp(join(tmpdir(), 'sa-panel-')))
+async function fixture(synthetic = false, privateStorage = false) {
+  const root = await realpath(await mkdtemp(join(privateStorage ? homedir() : tmpdir(), '.sa-panel-')))
   const state = join(root, 's'), repo = join(root, 'r')
   await git(root, ['init', '-b', 'main', repo])
   await writeFile(join(repo, 'README'), 'fixture\n')
@@ -31,6 +34,81 @@ async function fixture(synthetic = false) {
   const plan = (service.engine.call('plan_create', { repositoryId: service.store.repository()!.id, title: 'Reviewed plan', tasks: [{ key: 'integration', title: 'Acceptance', request: 'Explicit bounded work' }], dependencies: [], integrationKey: 'integration', maxAttempts: 2, expiresAt: new Date(Date.now() + 3_600_000).toISOString(), requestId: randomUUID() }) as { plan: Plan }).plan
   return { state, service, panel, headers, post, plan, async close() { await panel.close(); await service.close(); await rm(root, { recursive: true, force: true }) } }
 }
+
+test('workspace preview and migration require authenticated same-origin confirmation and matching targets', async () => {
+  const context = await fixture(true)
+  try {
+    const plan = context.plan
+    const url = `/api/plans/${plan.id}/workspace/preview`
+    const params = { planId: plan.id, expectedRevision: plan.revision, repositoryId: context.service.store.repository()!.id, baseRef: 'refs/heads/main', branchPrefix: 'superagent' }
+    const unauthenticated = await fetch(`${context.panel.origin}${url}`, { method: 'POST', headers: { origin: context.panel.origin, 'content-type': 'application/json' }, body: JSON.stringify(params) })
+    assert.equal(unauthenticated.status, 401)
+    assert.equal((await context.post(url, params, { 'x-superagent-csrf': 'wrong' })).status, 403)
+    assert.equal((await context.post(url, params, { origin: 'https://example.invalid' })).status, 403)
+    assert.equal((await context.post(url, { ...params, planId: randomUUID() })).status, 400)
+    const preview = await (await context.post(url, params)).json() as any
+    assert.equal(preview.ok, true)
+    const configure = { planId: plan.id, expectedRevision: plan.revision, previewId: preview.data.id, requestId: randomUUID(), confirmation: 'not-confirmed' }
+    const endpoint = `/api/plans/${plan.id}/workspace/configure`
+    const denied = await (await context.post(endpoint, configure)).json() as any
+    assert.equal(denied.error.code, 'APPROVAL_REQUIRED')
+    const accepted = await (await context.post(endpoint, { ...configure, confirmation: plan.id })).json() as any
+    assert.equal(accepted.ok, true)
+    assert.equal(accepted.data.requiresApproval, true)
+    assert.equal(context.service.store.entity<Plan>('plan', plan.id)!.grant, undefined)
+    const ticket = context.service.engine.require(plan.ticketIds[0]!)
+    const taskEndpoint = `/api/tasks/${ticket.id}/workspace/prepare`
+    assert.equal((await context.post(taskEndpoint, { ticketId: randomUUID(), expectedRevision: ticket.revision })).status, 400)
+    const blocked = await (await context.post(taskEndpoint, { ticketId: ticket.id, expectedRevision: ticket.revision })).json() as any
+    assert.equal(blocked.error.code, 'WORKSPACE_NOT_READY')
+  } finally { await context.close() }
+})
+
+test('task deletion is confirmed, authenticated, CSRF protected and unavailable to bridge or noninteractive CLI', async () => {
+  const context = await fixture()
+  try {
+    const ticket = (context.service.engine.call('task_create', { repositoryId: context.service.store.repository()!.id, title: 'Remove draft', request: 'Fixture task', requestId: randomUUID() }) as any).ticket
+    const params = { ticketId: ticket.id, expectedRevision: ticket.revision, requestId: randomUUID() }
+    const payload = { action: 'delete-task', params, confirmation: ticket.id }
+    assert.equal((await context.post('/api/control', payload, { cookie: '' })).status, 401)
+    assert.equal((await context.post('/api/control', payload, { 'x-superagent-csrf': 'wrong' })).status, 403)
+    assert.equal((await context.post('/api/control', { ...payload, confirmation: 'wrong' })).status, 403)
+    assert.equal((await invoke(context.state, 'bridge', 'delete-task', params)).error?.code, 'FORBIDDEN')
+    await assert.rejects(promisify(execFile)(process.execPath, [fileURLToPath(new URL('../service/src/cli.js', import.meta.url)), 'task', 'delete', '--state', context.state, '--json', JSON.stringify(params)]), /interactive terminal/)
+    assert.ok(context.service.store.ticket(ticket.id))
+    const result = await (await context.post('/api/control', payload)).json() as any
+    assert.equal(result.ok, true)
+    assert.equal(result.data.deleted, true)
+    assert.equal(context.service.store.ticket(ticket.id), undefined)
+    assert.deepEqual((await (await context.post('/api/control', payload)).json() as any).data, result.data)
+    assert.equal((await invoke(context.state, 'bridge', 'task_get', { ticketId: ticket.id })).error?.code, 'NOT_FOUND')
+    assert.ok(context.service.store.entity('deleted_task', ticket.id))
+    const page = await (await fetch(`${context.panel.origin}/api/tasks?view=all`, { headers: { cookie: context.headers.cookie } })).json() as any
+    assert.equal(page.data.items.some((entry: any) => entry.id === ticket.id), false)
+  } finally { await context.close() }
+})
+
+test('panel deletes a reviewed whole plan but refuses individual members or stale member revisions', async () => {
+  const context = await fixture()
+  try {
+    const ticket = context.service.engine.require(context.plan.integrationId)
+    const individual = await (await context.post('/api/control', { action: 'delete-task', params: { ticketId: ticket.id, expectedRevision: ticket.revision, requestId: randomUUID() }, confirmation: ticket.id })).json() as any
+    assert.equal(individual.error.code, 'DEPENDENCY_CONFLICT')
+    const params = { planId: context.plan.id, expectedRevision: context.plan.revision, requestId: randomUUID(), tasks: [{ ticketId: ticket.id, expectedRevision: ticket.revision }] }
+    assert.equal((await invoke(context.state, 'bridge', 'delete-plan', params)).error?.code, 'FORBIDDEN')
+    const stale = await (await context.post('/api/control', { action: 'delete-plan', params: { ...params, tasks: [{ ticketId: ticket.id, expectedRevision: ticket.revision + 1 }] }, confirmation: context.plan.id })).json() as any
+    assert.equal(stale.error.code, 'REVISION_CONFLICT')
+    assert.ok(context.service.store.ticket(ticket.id))
+    const result = await (await context.post('/api/control', { action: 'delete-plan', params, confirmation: context.plan.id })).json() as any
+    assert.equal(result.ok, true)
+    assert.equal(context.service.store.tickets().length, 0)
+    assert.equal(context.service.store.entities('plan').length, 0)
+    const page = await (await fetch(`${context.panel.origin}/api/plans`, { headers: { cookie: context.headers.cookie } })).json() as any
+    assert.deepEqual(page.data.items, [])
+    const script = await (await fetch(`${context.panel.origin}/panel.js`)).text()
+    assert.ok(script.includes('delete-task') && script.includes('delete-plan'))
+  } finally { await context.close() }
+})
 
 test('panel offers server-side compact task filters, pending notes and versioned scope adjustment', async () => {
   const context = await fixture()
@@ -65,6 +143,64 @@ test('panel offers server-side compact task filters, pending notes and versioned
   } finally { await context.close() }
 })
 
+test('panel confirms a single extra retry directly and preserves the plan limit', async () => {
+  const context = await fixture(true)
+  try {
+    const { engine, store } = context.service
+    const ticketId = context.plan.ticketIds[0]!
+    engine.call('plan_start', { planId: context.plan.id, expectedRevision: context.plan.revision, requestId: randomUUID() })
+    const planApproval = store.approvals(context.plan.id).find(entry => entry.status === 'pending')!
+    engine.approve(planApproval.id, true, String(planApproval.details.fingerprint))
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (attempt) engine.call('task_retry', { ticketId, expectedRevision: engine.require(ticketId).revision, requestId: randomUUID() })
+      const effect = store.effects('pending').find(entry => entry.ticketId === ticketId && entry.kind === 'launch')!
+      store.set('paused', false)
+      const ticket = engine.claim(effect)!
+      store.set('paused', true)
+      engine.fail(ticketId, latestAssignment(ticket)!.id, 'Synthetic failure')
+      store.saveEffect({ ...store.effects().find(entry => entry.key === effect.key)!, state: 'done' })
+    }
+    const control = { action: 'task_retry', params: { ticketId, expectedRevision: engine.require(ticketId).revision, requestId: randomUUID() }, confirmation: ticketId }
+    assert.equal((await context.post('/api/control', control, { 'x-superagent-csrf': 'wrong' })).status, 403)
+    assert.equal((await (await context.post('/api/control', control)).json() as any).ok, true)
+    const approval = store.approvals(ticketId).find(entry => entry.kind === 'retry')!
+    assert.equal(approval.status, 'accepted')
+    assert.equal(approval.details.extraAttempt, true)
+    assert.equal(approval.details.generation, 3)
+    assert.equal((await (await context.post('/api/control', control)).json() as any).ok, true)
+    assert.equal(latestAssignment(engine.require(ticketId))!.generation, 3)
+    assert.equal(store.entity<Plan>('plan', context.plan.id)!.maxAttempts, 2)
+    assert.equal(engine.view(engine.require(ticketId)).scheduling.state, 'paused')
+    assert.equal((await invoke(context.state, 'bridge', 'decide', { id: approval.id, accept: true })).error?.code, 'FORBIDDEN')
+    assert.equal((await invoke(context.state, 'bridge', 'human-control', { action: control.action, params: control.params })).error?.code, 'FORBIDDEN')
+  } finally { await context.close() }
+})
+
+test('panel attaches task references only after human preview and confirmation, never through bridge MCP', async () => {
+  const context = await fixture(false, true)
+  try {
+    const { ticket } = context.service.engine.call('task_create', { repositoryId: context.service.store.repository()!.id, title: 'Reference UI', request: 'Use reviewed local reference', requestId: randomUUID() }) as { ticket: { id: string; revision: number } }
+    const source = join(context.service.store.repository()!.path, 'reference.pdf')
+    await writeFile(source, 'Synthetic UI reference')
+    const path = `/api/tasks/${ticket.id}/materials`
+    const params = { ticketId: ticket.id, expectedRevision: ticket.revision, paths: [source] }
+    assert.equal((await context.post(`${path}/preview`, params, { 'x-superagent-csrf': 'wrong' })).status, 403)
+    const preview = await (await context.post(`${path}/preview`, params)).json() as any
+    assert.equal(preview.ok, true, JSON.stringify(preview))
+    const input = { ticketId: ticket.id, expectedRevision: ticket.revision, previewId: preview.data.id, requestId: randomUUID(), confirmation: ticket.id }
+    assert.equal((await invoke(context.state, 'bridge', 'task-materials-attach', input)).error?.code, 'FORBIDDEN')
+    const wrong = await (await context.post(`${path}/attach`, { ...input, confirmation: randomUUID() })).json() as any
+    assert.equal(wrong.error.code, 'FORBIDDEN')
+    const result = await (await context.post(`${path}/attach`, input)).json() as any
+    assert.equal(result.ok, true, JSON.stringify(result))
+    assert.equal(result.data.executionStarted, false)
+    const list = await (await fetch(`${context.panel.origin}${path}`, { headers: { cookie: context.headers.cookie } })).json() as any
+    assert.equal(list.data.files.length, 1)
+    assert.equal((await fetch(`${context.panel.origin}${path}`)).status, 401)
+    assert.equal(context.service.engine.require(ticket.id).mandate.executionGranted, false)
+  } finally { await context.close() }
+})
+
 test('panel rejects missing authentication, CSRF, cross-origin, oversized and unknown controls', async () => {
   const context = await fixture()
   try {
@@ -83,11 +219,34 @@ test('panel rejects missing authentication, CSRF, cross-origin, oversized and un
   } finally { await context.close() }
 })
 
+test('one panel goal confirmation distributes declared files without per-task attachment or a second approval', async () => {
+  const context = await fixture(true, true)
+  try {
+    const { engine, store } = context.service
+    const source = join(store.repository()!.path, 'goal-reference.pdf')
+    await writeFile(source, 'Synthetic goal reference')
+    const { plan } = engine.call('plan_create', { repositoryId: store.repository()!.id, title: 'One goal confirmation', tasks: [{ key: 'read', title: 'Read', request: 'Read declared reference' }, { key: 'final', title: 'Final', request: 'Summarize' }], dependencies: [{ before: 'read', after: 'final', condition: 'artifact' }], integrationKey: 'final', workflow: { materialPaths: [source] }, expiresAt: new Date(Date.now() + 3600_000).toISOString(), requestId: randomUUID() }) as { plan: Plan }
+    const control = { action: 'plan_start', params: { planId: plan.id, expectedRevision: plan.revision, requestId: randomUUID() }, confirmation: plan.id }
+    assert.equal((await invoke(context.state, 'bridge', 'human-control', { action: control.action, params: control.params })).error?.code, 'FORBIDDEN')
+    assert.equal((await context.post('/api/control', control, { 'x-superagent-csrf': 'wrong' })).status, 403)
+    const response = await (await context.post('/api/control', control)).json() as any
+    assert.equal(response.ok, true, JSON.stringify(response))
+    assert.ok(store.entity<Plan>('plan', plan.id)!.grant)
+    const references = plan.ticketIds.map(id => store.entity<{ path: string }[]>('task_materials', id)!)
+    assert.equal(references[0]!.length, 1)
+    assert.equal(references[0]![0]!.path, references[1]![0]!.path)
+    assert.equal(await readFile(references[0]![0]!.path, 'utf8'), 'Synthetic goal reference')
+    assert.equal(store.approvals(plan.id).filter(approval => approval.status === 'pending').length, 0)
+    assert.equal((await (await context.post('/api/control', control)).json() as any).ok, true)
+    assert.ok(plan.ticketIds.every(id => engine.require(id).assignments.length === 1))
+  } finally { await context.close() }
+})
+
 test('panel plan approval requires full preview, exact confirmation and single-use review', async () => {
-  const context = await fixture()
+  const context = await fixture(true)
   try {
     const { post, plan, service, panel, headers } = context
-    const start = await (await post('/api/control', { action: 'plan_start', params: { planId: plan.id, expectedRevision: plan.revision, requestId: randomUUID() }, confirmation: plan.id })).json() as any
+    const start = await invoke(context.state, 'bridge', 'plan_start', { planId: plan.id, expectedRevision: plan.revision, requestId: randomUUID() })
     assert.equal(start.ok, true)
     const approval = service.store.approvals(plan.id)[0]!
     const list = await (await fetch(`${panel.origin}/api/approvals`, { headers: { cookie: headers.cookie } })).json() as any
@@ -192,8 +351,6 @@ test('panel accepts only settled ready results before whole-plan completion and 
     assert.equal(((await (await accept('code')).json()) as any).ok, false)
     assert.equal(((await (await accept('artifact')).json()) as any).ok, true)
     assert.equal(((await (await accept('artifact')).json()) as any).ok, false)
-    const complete = await (await post('/api/control', { action: 'complete-plan', params: { planId: plan.id, expectedRevision: service.store.entity<Plan>('plan', plan.id)!.revision }, confirmation: plan.id })).json() as any
-    assert.equal(complete.ok, true)
     assert.equal(service.store.entity<Plan>('plan', plan.id)!.completed, true)
   } finally { await context.close() }
 })

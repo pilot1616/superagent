@@ -32,7 +32,7 @@ export class AppServer extends EventEmitter {
     this.child = spawn(command, args, { ...options, stdio: 'pipe', detached: process.platform !== 'win32' })
     if (this.child.pid && process.platform !== 'win32') {
       this.tracker = new ProcessTracker(this.child.pid)
-      this.observationTimer = setInterval(() => this.tracker?.sample(), 250)
+      this.observationTimer = setInterval(() => { void this.tracker?.sample() }, 250)
       this.observationTimer.unref()
     }
     this.child.stdout.setEncoding('utf8')
@@ -80,6 +80,7 @@ export class AppServer extends EventEmitter {
     this.child.stdin.write(`${JSON.stringify(message)}\n`)
   }
   async initialize(): Promise<unknown> {
+    await this.tracker?.assertOwnedGroup()
     const result = await this.request('initialize', { clientInfo: { name: 'codex-superagent', version: '0.1.0' }, capabilities: { experimentalApi: false } })
     this.send({ method: 'initialized', params: {} })
     return result
@@ -99,22 +100,22 @@ export class AppServer extends EventEmitter {
     const pid = this.child.pid
     if (!pid) return
     if (process.platform === 'win32') throw new Error('Process-tree termination is not verified on Windows; manual reconciliation required')
-    const present = () => {
+    const present = async () => {
       try { process.kill(-pid, 0); return true }
-      catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false; if ((error as NodeJS.ErrnoException).code === 'EPERM') return !this.tracker?.groupAbsent(); throw error }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false; if ((error as NodeJS.ErrnoException).code === 'EPERM') return !await this.tracker?.groupAbsent(); throw error }
     }
     const terminate = (signal: NodeJS.Signals) => {
       try { process.kill(-pid, signal) }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error }
     }
     for (const signal of ['SIGTERM', 'SIGKILL'] as const) {
-      if (!present()) { this.tracker?.assertNoObservedEscape(); return }
-      this.tracker?.assertOwnedGroup()
+      if (!await present()) { await this.tracker?.assertNoObservedEscape(); return }
+      await this.tracker?.assertOwnedGroup()
       terminate(signal)
       const deadline = Date.now() + 3_000
       do {
         await delay(25)
-        if (!present()) { this.tracker?.assertNoObservedEscape(); return }
+        if (!await present()) { await this.tracker?.assertNoObservedEscape(); return }
       } while (Date.now() < deadline)
     }
     throw new Error('Owned process group did not disappear; keep the task in reconciliation')

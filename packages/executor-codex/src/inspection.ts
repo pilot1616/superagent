@@ -1,13 +1,17 @@
 import { createHash, randomUUID } from 'node:crypto'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import { access, readFile, readdir, realpath, lstat } from 'node:fs/promises'
 import { constants, statSync, readFileSync, realpathSync, readdirSync } from 'node:fs'
-import { arch, platform, release, homedir } from 'node:os'
-import { basename, dirname, join } from 'node:path'
+import { arch, platform, release } from 'node:os'
+import { basename, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { AppServer } from './rpc.js'
 import { codexVersion, SUPPORTED_CODEX } from './probe.js'
 import { canonicalJson, loadProfile, providerEnvironment, safeWorkerPath, workerEnvironment, type WorkerProfile } from './profile.js'
 import { inspectionSchema, type RuntimeInspection } from './contracts.js'
+import { processSnapshot } from './processes.js'
+import { capabilityShell, workerFilesystem } from './capabilities.js'
 
 export const sha256 = (value: string | Buffer) => createHash('sha256').update(value).digest('hex')
 export async function resolveBinary(binary = 'codex'): Promise<string> {
@@ -18,7 +22,7 @@ export async function resolveBinary(binary = 'codex'): Promise<string> {
 }
 async function treeHash(directory: string): Promise<string> {
   const entries = (await readdir(directory, { withFileTypes: true })).sort((left, right) => left.name.localeCompare(right.name))
-  return sha256(canonicalJson(await Promise.all(entries.filter(entry => entry.isDirectory() || /\.(js|json)$/.test(entry.name)).map(async entry => [entry.name, entry.isDirectory() ? await treeHash(join(directory, entry.name)) : sha256(await readFile(join(directory, entry.name)))]))))
+  return sha256(canonicalJson(await Promise.all(entries.filter(entry => entry.isDirectory() || /\.(js|json|bin)$/.test(entry.name)).map(async entry => [entry.name, entry.isDirectory() ? await treeHash(join(directory, entry.name)) : sha256(await readFile(join(directory, entry.name)))]))))
 }
 export function credentialStamp(profile: WorkerProfile): string {
   const path = profile.provider.authMode === 'env' ? join(profile.home, 'provider-credentials.json') : join(profile.home, '.codex', 'auth.json')
@@ -34,13 +38,13 @@ export function launchStamp(state: string, executable: string): string {
   return sha256(canonicalJson({ executable: realpathSync(executable), executableStamp: `${info.ino}:${info.size}:${info.mtimeNs}:${info.ctimeNs}`, build: runtimeCodeStamp(), config: sha256(readFileSync(join(profile.home, '.codex', 'config.toml'))), profile: sha256(readFileSync(join(state, 'worker-profile.json'))), authStamp: credentialStamp(profile) }))
 }
 export function runtimeCodeStamp(): string {
-  const tree = (directory: string): unknown[] => readdirSync(directory, { withFileTypes: true }).filter(entry => entry.isDirectory() || /\.(js|json)$/.test(entry.name)).sort((left, right) => left.name < right.name ? -1 : 1).map(entry => [entry.name, entry.isDirectory() ? tree(join(directory, entry.name)) : sha256(readFileSync(join(directory, entry.name)))])
+  const tree = (directory: string): unknown[] => readdirSync(directory, { withFileTypes: true }).filter(entry => entry.isDirectory() || /\.(js|json|bin)$/.test(entry.name)).sort((left, right) => left.name < right.name ? -1 : 1).map(entry => [entry.name, entry.isDirectory() ? tree(join(directory, entry.name)) : sha256(readFileSync(join(directory, entry.name)))])
   return sha256(canonicalJson(['core/src', 'storage/src', 'executor-codex', 'service/src', 'integrations-gitlab/src'].map(name => [name, tree(fileURLToPath(new URL(`../../${name}/`, import.meta.url)))])))
 }
-export function effectiveProfile(config: any, profile: WorkerProfile): boolean {
-  const filesystem = { glob_scan_max_depth: null, ':minimal': 'read', ':workspace_roots': 'write', [dirname(profile.home)]: 'deny', [homedir()]: 'deny' }
+export function effectiveProfile(config: any, profile: WorkerProfile, readRoots: string[] = [], gitWriteRoot?: string): boolean {
+  const filesystem = { glob_scan_max_depth: null, ...workerFilesystem(profile.home, profile.capabilities, readRoots, gitWriteRoot) }
   const shell = config.shell_environment_policy
-  const environmentMatches = shell?.inherit === 'none' && canonicalJson([...(shell.include_only ?? [])].sort()) === canonicalJson(['HOME', 'PATH', 'TMPDIR']) && Object.keys(shell.set ?? {}).length === 0 && !shell.experimental_use_profile && !shell.filters?.length
+  const environmentMatches = shell?.inherit === 'none' && canonicalJson([...(shell.include_only ?? [])].sort()) === canonicalJson(['HOME', 'PATH', 'TMPDIR']) && canonicalJson(shell.set ?? {}) === canonicalJson(capabilityShell(profile.capabilities)) && !shell.experimental_use_profile && !shell.filters?.length
   const provider = config.model_providers?.[profile.provider.id]
   const providerMatches = profile.provider.id === 'openai' ? !provider && !config.openai_base_url : provider?.base_url === profile.provider.baseUrl && (provider.env_key ?? null) === (profile.provider.envKey ?? null) && provider.wire_api === 'responses' && provider.requires_openai_auth === false && !provider.experimental_bearer_token && !provider.auth && !provider.aws && !Object.keys(provider.http_headers ?? {}).length && !Object.keys(provider.env_http_headers ?? {}).length && !Object.keys(provider.query_params ?? {}).length && !provider.supports_standalone_web_search
   const permissions = config.permissions?.['superagent-worker']
@@ -54,8 +58,16 @@ export async function inspectRuntime(state: string, repositoryId: string, authGe
   const version = codexVersion(executable)
   const checkedAt = new Date().toISOString()
   const checks: RuntimeInspection['checks'] = [{ key: 'version', status: version === SUPPORTED_CODEX ? 'passed' : 'failed', reasonCode: version === SUPPORTED_CODEX ? undefined : 'RUNTIME_UNSUPPORTED', nextAction: `Use ${SUPPORTED_CODEX}` }, { key: 'platform', status: ['darwin', 'linux'].includes(platform()) ? 'passed' : 'failed', reasonCode: ['darwin', 'linux'].includes(platform()) ? undefined : 'RUNTIME_UNSUPPORTED' }]
+  try {
+    const result = await promisify(execFile)(executable, ['sandbox', '-P', 'superagent-worker', '-C', state, '--', profile.capabilities?.toolchain.gitExecutable ?? 'git', '--version'], { env: workerEnvironment(profile), timeout: 3000, maxBuffer: 16000 })
+    if (!/^git version /m.test(result.stdout)) throw new Error('Unexpected Git version response')
+    checks.push({ key: 'toolchain_git', status: 'passed' })
+  } catch {
+    checks.push({ key: 'toolchain_git', status: 'failed', reasonCode: 'WORKER_GIT_UNAVAILABLE', nextAction: 'Git failed in the isolated Worker environment; configure trusted PATH/read roots and DEVELOPER_DIR, rather than assuming host Git is absent' })
+  }
   let auth: RuntimeInspection['auth']['status'] = 'unknown'
   if (version === SUPPORTED_CODEX) {
+    await processSnapshot()
     let environment = workerEnvironment(profile)
     let credentialsValid = true
     try { environment = await providerEnvironment(profile) } catch { credentialsValid = false }
@@ -82,7 +94,7 @@ export async function inspectRuntime(state: string, repositoryId: string, authGe
   const policyHash = sha256(canonicalJson({ policyVersion: 1, mode: 'restricted_local', backend: profile.backend, config: profile.config }))
   const provider = { id: profile.provider.id, authMode: profile.provider.authMode, endpointOrigin: profile.provider.baseUrl ? new URL(profile.provider.baseUrl).origin : undefined }
   const fingerprint = sha256(canonicalJson({ version: 1, executable, executableHash, runtimeBuildHash, protocolSchemaHash, profileHash: profile.hash, policyHash, model: profile.model, provider: profile.provider, authGeneration, repositoryId, mode: 'restricted_local', platform: { os: platform(), release: release(), arch: arch() } }))
-  return inspectionSchema.parse({ id: randomUUID(), repositoryId, checkedAt, validUntil: new Date(Date.now() + ttlSeconds * 1000).toISOString(), fingerprint, executable: { realpath: executable, version, sha256: executableHash }, platform: { os: platform(), release: release(), arch: arch() }, runtimeBuildHash, protocolSchemaHash, profileHash: profile.hash, policyHash, model: profile.model, provider, agents: profile.agents, auth: { status: auth, generation: authGeneration }, checks })
+  return inspectionSchema.parse({ id: randomUUID(), repositoryId, checkedAt, validUntil: new Date(Date.now() + ttlSeconds * 1000).toISOString(), fingerprint, executable: { realpath: executable, version, sha256: executableHash }, platform: { os: platform(), release: release(), arch: arch() }, runtimeBuildHash, protocolSchemaHash, profileHash: profile.hash, policyHash, model: profile.model, provider, agents: profile.agents, capabilities: profile.capabilities, auth: { status: auth, generation: authGeneration }, checks })
 }
 export function publicInspection(inspection?: RuntimeInspection) {
   if (!inspection) return undefined

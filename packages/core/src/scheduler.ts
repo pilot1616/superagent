@@ -1,5 +1,6 @@
 import { latestAssignment, type Effect, type Plan, type Ticket } from './model.js'
 import type { Persistence } from './ports.js'
+import { withinExecutionBudget } from './retry.js'
 
 export interface Scheduling { state: string; reasons: string[]; reasonCodes?: string[] }
 export function humanWake(ticket: Ticket): boolean {
@@ -11,7 +12,7 @@ export function occupied(store: Persistence, active: ReadonlySet<string> = new S
 export function workerOccupied(store: Persistence, active: ReadonlySet<string> = new Set()): Set<string> {
   return new Set([...active, ...store.tickets().filter(ticket => latestAssignment(ticket)?.state === 'running' || ticket.stopping || (ticket.reconciliation && store.effects().some(effect => effect.ticketId === ticket.id && effect.kind !== 'publish' && effect.state === 'uncertain'))).map(ticket => ticket.id), ...store.effects().filter(effect => effect.kind !== 'publish' && (effect.state === 'running' || effect.state === 'uncertain')).map(effect => effect.ticketId)])
 }
-export function scheduling(store: Persistence, ticket: Ticket, active: ReadonlySet<string> = new Set()): Scheduling {
+export function scheduling(store: Persistence, ticket: Ticket, active: ReadonlySet<string> = new Set(), ignoreWorkspace = false): Scheduling {
   const blocked = (state: string, ...reasons: string[]) => ({ state, reasons })
   if (ticket.reconciliation) return blocked('reconciling', ticket.reconciliation)
   if (ticket.mandate.humanHold || ticket.stopping) return blocked('held', 'Task has a human hold or is stopping')
@@ -26,7 +27,7 @@ export function scheduling(store: Persistence, ticket: Ticket, active: ReadonlyS
     if (!plan) return blocked('waiting_authorization', 'Missing plan')
     if (plan.held || plan.paused || plan.completed) return blocked(plan.held ? 'held' : 'paused', 'Plan is held, paused or completed')
     if (!plan.grant || plan.grant.version !== plan.version || Date.parse(plan.expiresAt) <= Date.now()) return blocked('waiting_authorization', 'Plan version needs unexpired human authorization')
-    if ((latestAssignment(ticket)?.generation ?? 0) > plan.maxAttempts) return blocked('waiting_authorization', 'Plan execution budget exhausted')
+    if (!withinExecutionBudget(store, ticket, plan)) return blocked('waiting_authorization', 'Plan execution budget exhausted; request human approval for one additional attempt')
     const missing = plan.dependencies.filter(edge => edge.after === ticket.id).filter(edge => {
       const upstream = store.ticket(edge.before)
       return !upstream?.result || upstream.result.kind !== edge.condition || upstream.mandate.humanHold || upstream.reconciliation || upstream.stopping
@@ -34,6 +35,8 @@ export function scheduling(store: Persistence, ticket: Ticket, active: ReadonlyS
     if (missing.length) return blocked('waiting_dependencies', ...missing.map(edge => `${edge.before}: requires accepted ${edge.condition}`))
   }
   if (!ticket.mandate.executionGranted) return blocked('waiting_authorization', 'Execution has not been authorized')
+  const workspaceBlocker = store.get<{ bindingId?: string; reason: string; code: string }>(`workspace:blocker:${ticket.id}`)
+  if (!ignoreWorkspace && workspaceBlocker && workspaceBlocker.bindingId === ticket.workspaceBinding?.id) return { state: 'waiting_workspace', reasons: [workspaceBlocker.reason], reasonCodes: [workspaceBlocker.code] }
   const holders = occupied(store, active)
   const conflicts = store.tickets().filter(other => other.id !== ticket.id && holders.has(other.id) && (latestAssignment(other)?.resources ?? other.resources)?.some(resource => ticket.resources?.includes(resource)))
   if (conflicts.length) return blocked('waiting_resources', ...conflicts.map(other => other.id))
@@ -52,8 +55,9 @@ export function validInputs(store: Persistence, ticket: Ticket): boolean {
   })
 }
 export function candidates(store: Persistence, active: ReadonlySet<string>, busy: ReadonlySet<string>, capacity: number): Effect[] {
-  const used = workerOccupied(store, active)
   const launches = store.effects('pending').filter(effect => effect.kind === 'launch' && effect.dueAt <= Date.now())
+  const preparing = launches.filter(effect => busy.has(effect.ticketId)).map(effect => effect.ticketId)
+  const used = workerOccupied(store, new Set([...active, ...preparing]))
   const scored = launches.map(effect => ({ effect, ticket: store.ticket(effect.ticketId)! })).filter(entry => entry.ticket)
   const turns = new Map<string, number>()
   const compare = (left: typeof scored[number], right: typeof scored[number]) => {

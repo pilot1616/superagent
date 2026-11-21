@@ -1,11 +1,12 @@
 import { randomBytes, createHash } from 'node:crypto'
 import { z } from 'zod'
 import { tools } from '../../core/src/engine.js'
+import { deletionSchemas } from '../../core/src/deletion.js'
 import { DomainError, requireCondition, type Approval } from '../../core/src/model.js'
 import { invoke, type Envelope } from './ipc.js'
 
 const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex')
-const controls = ['task_start', 'task_resume', 'task_retry', 'task_stop', 'task_message', 'task_adjust', 'plan_start', 'plan_pause', 'plan_stop', 'accept-result', 'complete-plan'] as const
+const controls = ['task_start', 'task_resume', 'task_retry', 'task_stop', 'task_message', 'task_adjust', 'plan_start', 'plan_pause', 'plan_stop', 'accept-result', 'complete-plan', 'delete-task', 'delete-plan'] as const
 const controlSchema = z.object({ action: z.enum(controls), params: z.record(z.string(), z.unknown()), confirmation: z.string() }).strict()
 const resultSchema = z.object({ ticketId: z.string().min(1), expectedRevision: z.number().int().positive(), kind: z.enum(['artifact', 'code']), content: z.string().trim().min(1).max(30_000) }).strict()
 const completionSchema = z.object({ planId: z.string().min(1), expectedRevision: z.number().int().positive() }).strict()
@@ -58,10 +59,11 @@ export function panelActions(state: string) {
     },
     async control(raw: unknown): Promise<Envelope> {
       const { action, params, confirmation } = controlSchema.parse(raw)
-      const schema = action === 'accept-result' ? resultSchema : action === 'complete-plan' ? completionSchema : tools[action]
+      const schema = action === 'delete-task' || action === 'delete-plan' ? deletionSchemas[action] : action === 'accept-result' ? resultSchema : action === 'complete-plan' ? completionSchema : tools[action]
       const validated = schema.parse(params) as Record<string, unknown>
       const target = validated.ticketId ?? validated.planId
       requireCondition(typeof target === 'string' && confirmation === target, 'FORBIDDEN', 'Type the complete target ID to confirm')
+      if (['task_start', 'task_resume', 'task_retry', 'plan_start'].includes(action)) return invoke(state, 'admin', 'human-control', { action, params: validated })
       return invoke(state, action.includes('-') ? 'admin' : 'bridge', action, validated)
     },
   }

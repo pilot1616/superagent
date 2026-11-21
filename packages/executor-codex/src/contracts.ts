@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { workerAgentsSchema } from './profile.js'
+import { capabilitiesSchema } from './capabilities.js'
 
 const text = z.string().min(1).max(1024)
 const hash = z.string().regex(/^[a-f0-9]{64}$/)
@@ -13,6 +14,7 @@ export const inspectionSchema = z.object({
   runtimeBuildHash: hash, protocolSchemaHash: hash, profileHash: hash, policyHash: hash, model: text,
   provider: z.object({ id: text, endpointOrigin: text.optional(), authMode: z.enum(['openai', 'env', 'none']) }).strict(),
   agents: workerAgentsSchema.optional(),
+  capabilities: capabilitiesSchema.optional(),
   auth: z.object({ status: z.enum(['configured', 'missing', 'expired', 'unsupported', 'unknown']), generation: z.number().int().nonnegative() }).strict(),
   checks: z.array(checkSchema).max(40),
 }).strict()

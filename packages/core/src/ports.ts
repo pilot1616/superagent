@@ -8,6 +8,7 @@ export interface RuntimeGate {
   validate(permit: ExecutionPermit): void
   quarantine(reasonCode: string, assignmentIds: string[]): void
   invalidate?(reasonCode: string): void
+  recheck?(): void
 }
 
 export interface Persistence {
@@ -17,10 +18,12 @@ export interface Persistence {
   entity<Result>(kind: string, id: string): Result | undefined
   entities<Result>(kind: string): Result[]
   saveEntity(kind: string, id: string, value: unknown): void
+  removeEntity(kind: string, id: string): void
   repository(): Repository | undefined
   ticket(id: string): Ticket | undefined
   tickets(): Ticket[]
   save(ticket: Ticket): void
+  removeTicket(id: string): void
   approval(id: string): Approval | undefined
   approvals(ticketId?: string): Approval[]
   saveApproval(approval: Approval): void

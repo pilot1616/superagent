@@ -65,9 +65,21 @@ export async function startPanel(state: string, port = 0) {
         const runtimeRoutes: Record<string, string> = { '/api/runtime/check': 'runtime-check', '/api/runtime/verification/preview': 'runtime-verify-preview', '/api/runtime/verification/start': 'runtime-verify', '/api/runtime/enable/preview': 'runtime-enable-preview', '/api/runtime/enable': 'runtime-enable', '/api/runtime/disable/preview': 'runtime-disable-preview', '/api/runtime/disable': 'runtime-disable', '/api/runtime/reconcile': 'runtime-reconcile' }
         const cancel = url.pathname.match(/^\/api\/runtime\/verification\/([a-f0-9-]{36})\/cancel$/)
         const answer = url.pathname.match(/^\/api\/runtime\/input\/([a-f0-9-]{36})\/answer$/)
-        if (!match && !runtimeRoutes[url.pathname] && !cancel && !answer && !['/api/control', '/api/worker-check'].includes(url.pathname)) { fail(405, 'Unknown control endpoint'); return }
+        const materials = url.pathname.match(/^\/api\/tasks\/([a-f0-9-]{36})\/materials\/(preview|attach)$/)
+        const workspacePlan = url.pathname.match(/^\/api\/plans\/([a-f0-9-]{36})\/workspace\/(preview|configure)$/)
+        const workspaceTask = url.pathname.match(/^\/api\/tasks\/([a-f0-9-]{36})\/workspace\/prepare$/)
+        if (!match && !runtimeRoutes[url.pathname] && !cancel && !answer && !materials && !workspacePlan && !workspaceTask && !['/api/control', '/api/worker-check'].includes(url.pathname)) { fail(405, 'Unknown control endpoint'); return }
         const input = await body()
         if (input === undefined) return
+        if (workspacePlan || workspaceTask) {
+          const target = workspacePlan ?? workspaceTask!
+          if (!input || typeof input !== 'object' || input[workspacePlan ? 'planId' : 'ticketId'] !== target[1]) { fail(400, 'URL target must match workspace operation'); return }
+          json(await actions.runtime(workspacePlan ? workspacePlan[2] === 'preview' ? 'plan_workspace_preview' : 'plan-workspace-configure' : 'task_workspace_prepare', input)); return
+        }
+        if (materials) {
+          if (!input || typeof input !== 'object' || input.ticketId !== materials[1]) { fail(400, 'URL task must match the reference target'); return }
+          json(await actions.runtime(`task-materials-${materials[2]}`, input)); return
+        }
         if (runtimeRoutes[url.pathname]) { json(await actions.runtime(runtimeRoutes[url.pathname]!, input)); return }
         if (cancel || answer) {
           if (!input || typeof input !== 'object' || input.id !== (cancel ?? answer)![1]) { fail(400, 'URL target must match the confirmed request'); return }
@@ -79,6 +91,7 @@ export async function startPanel(state: string, port = 0) {
       if (url.pathname === '/api/session') { json({ ok: true, data: { csrf } }); return }
       if (url.pathname === '/api/approvals') { json({ ok: true, data: await actions.pending() }); return }
       if (url.pathname === '/api/runtime') { json(await actions.runtime('runtime-status', {})); return }
+      if (/^\/api\/tasks\/[a-f0-9-]{36}\/materials$/.test(url.pathname)) { json(await actions.runtime('task-materials-list', { ticketId: url.pathname.split('/')[3] })); return }
       if (/^\/api\/runtime\/verification\/[a-f0-9-]{36}$/.test(url.pathname)) { json(await actions.runtime('runtime-verification-get', { id: url.pathname.split('/').at(-1) })); return }
       let method: string
       let params: unknown = {}

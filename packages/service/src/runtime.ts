@@ -31,12 +31,9 @@ export class RuntimeController implements RuntimeGate {
     const repositoryId = store.repository()!.id
     const previous = store.entity<RuntimeState>('runtime_state', repositoryId)
     let state = previous ? runtimeStateSchema.parse(previous) : runtimeStateSchema.parse({ repositoryId, revision: 1, fence: 0, mode: 'restricted_local', policyVersion: 1, updatedAt: new Date().toISOString() })
-    if (state.enablementId) {
-      const enablement = this.snapshot().enablement
-      if (enablement?.status === 'active') store.saveEntity('runtime_enablement', enablement.id, { ...enablement, status: 'invalidated' })
-    }
-    if (previous) state = { ...state, revision: state.revision + 1, fence: state.fence + 1, inspectionId: undefined, enablementId: undefined, updatedAt: new Date().toISOString() }
+    if (previous) state = { ...state, revision: state.revision + 1, fence: state.fence + 1, inspectionId: undefined, updatedAt: new Date().toISOString() }
     store.saveEntity('runtime_state', repositoryId, state)
+    this.clearReviews()
     if (state.verificationRunId) {
       const run = store.entity<RuntimeVerification>('runtime_verification', state.verificationRunId)
       if (run && ['prepared', 'running'].includes(run.state)) store.saveEntity('runtime_verification', run.id, { ...run, revision: run.revision + 1, state: 'cleanup_uncertain', reasonCode: 'VERIFICATION_INTERRUPTED', finishedAt: new Date().toISOString() })
@@ -80,6 +77,10 @@ export class RuntimeController implements RuntimeGate {
   check(): Promise<ReturnType<RuntimeController['status']>> {
     return this.checking ??= this.inspectCurrent().finally(() => { this.checking = undefined })
   }
+  recheck(): void {
+    this.store.atomic(() => this.update({ inspectionFailure: { reasonCode: 'RUNTIME_INSPECTION_STALE', at: new Date().toISOString() } }, 'runtime.recheck_requested', { reason: 'Settled pre-turn preparation failure' }, true))
+    void this.check()
+  }
   private async inspectCurrent() {
     try {
       requireCondition(this.loadedCodeStamp === runtimeCodeStamp(), 'RUNTIME_RESTART_REQUIRED', 'Runtime files changed after daemon startup; restart before inspection', 409)
@@ -101,6 +102,16 @@ export class RuntimeController implements RuntimeGate {
         if (same) this.store.saveEntity('runtime_state', this.state().repositoryId, { ...this.state(), inspectionId: inspection.id, inspectionFailure: undefined })
         else this.update({ inspectionId: inspection.id, inspectionFailure: undefined }, 'runtime.inspected', { inspectionId: inspection.id, checks: inspection.checks })
         this.stamp = currentStamp
+        const snapshot = this.snapshot()
+        const enablement = snapshot.enablement
+        if (enablement?.status === 'active' && enablement.daemonEpoch !== this.daemonEpoch) {
+          const restored = { ...enablement, daemonEpoch: this.daemonEpoch }
+          const uncertain = this.store.effects('uncertain').length > 0 || this.store.tickets().some(ticket => ticket.reconciliation || latestAssignment(ticket)?.state === 'running')
+          if (!uncertain && evaluateRuntime({ ...snapshot, enablement: restored }).canDispatch) {
+            this.store.saveEntity('runtime_enablement', restored.id, restored)
+            this.store.audit(snapshot.state.repositoryId, 'runtime.authorization_restored', { enablementId: restored.id, expiresAt: restored.expiresAt })
+          } else if (enablement.fingerprint !== inspection.fingerprint) this.invalidate('RUNTIME_FINGERPRINT_CHANGED')
+        }
       })
     } catch (error) {
       const code = error instanceof DomainError ? error.code : 'RUNTIME_UNSUPPORTED'
@@ -169,8 +180,13 @@ export class RuntimeController implements RuntimeGate {
       if (value.state === 'cleanup_uncertain') this.quarantine('PROCESS_CLEANUP_UNCERTAIN', [])
     })
   }
-  reconcile(raw: unknown) {
+  async reconcile(raw: unknown) {
     const params = operationSchema.extend({ reason: z.string().trim().min(10).max(1000) }).strict().parse(raw)
+    const needsSnapshot = this.store.tickets().some(ticket => {
+      const record = this.store.get<{ pid?: number; state: string }>(`process:${ticket.id}`)
+      return record?.pid && record.state !== 'group-closed'
+    }) || this.store.entities<{ state: string }>('runtime_verification_process').some(record => record.state !== 'group-closed')
+    const snapshot = needsSnapshot ? await processSnapshot() : new Map<number, ProcessIdentity>()
     return this.store.once(this.config.operatorId, 'runtime-reconcile', params.requestId, params, () => {
       this.requireRevision(params.expectedRevision, params.repositoryId, params.confirmation)
       requireCondition(this.state().quarantine, 'INVALID_STATE', 'Runtime is not quarantined', 409)
@@ -178,16 +194,14 @@ export class RuntimeController implements RuntimeGate {
       for (const ticket of this.store.tickets()) {
         const record = this.store.get<{ pid?: number; state: string; observedDescendants?: ProcessIdentity[] }>(`process:${ticket.id}`)
         if (!record?.pid || record.state === 'group-closed') continue
-        const snapshot = processSnapshot()
-        requireCondition(!record.observedDescendants?.some(identity => snapshot.get(identity.pid)?.start === identity.start), 'RECONCILIATION_REQUIRED', 'A previously observed Worker process is still alive; inspect its exact identity', 409)
+        requireCondition(!record.observedDescendants?.some(identity => { const current = snapshot.get(identity.pid); return current && (current.start === identity.start || current.start === 'unavailable') }), 'RECONCILIATION_REQUIRED', 'A previously observed Worker process is still alive or inaccessible; inspect its exact identity', 409)
         let absent = false
         try { process.kill(-record.pid, 0) } catch (error) { absent = (error as NodeJS.ErrnoException).code === 'ESRCH' }
         requireCondition(absent, 'RECONCILIATION_REQUIRED', 'A prior process group may still exist; never kill a reused PID blindly', 409)
       }
       for (const record of this.store.entities<{ pid: number; state: string; observed: ProcessIdentity[] }>('runtime_verification_process')) {
         if (record.state === 'group-closed') continue
-        const snapshot = processSnapshot()
-        requireCondition(!record.observed.some(identity => snapshot.get(identity.pid)?.start === identity.start), 'RECONCILIATION_REQUIRED', 'An observed verification process remains alive', 409)
+        requireCondition(!record.observed.some(identity => { const current = snapshot.get(identity.pid); return current && (current.start === identity.start || current.start === 'unavailable') }), 'RECONCILIATION_REQUIRED', 'An observed verification process remains alive or inaccessible', 409)
         let absent = false
         try { process.kill(-record.pid, 0) } catch (error) { absent = (error as NodeJS.ErrnoException).code === 'ESRCH' }
         requireCondition(absent, 'RECONCILIATION_REQUIRED', 'The interrupted verification process group still needs inspection', 409)
@@ -251,6 +265,15 @@ export class RuntimeController implements RuntimeGate {
       this.update({ enablementId: enablement.id }, 'runtime.enabled', { enablementId: enablement.id, fingerprint: enablement.fingerprint, verificationRequired: false, warningCodes: status.warningCodes }, true)
       return { operationId: randomUUID(), enablementId: enablement.id, expiresAt: enablement.expiresAt, capabilities: enablement.capabilities, runtime: this.status() }
     })
+  }
+  enableForWorkflow(expectedRevision: number, expectedFingerprint: string, planId: string) {
+    const status = this.status()
+    requireCondition(status.revision === expectedRevision && status.fingerprint === expectedFingerprint, 'REVISION_CONFLICT', 'Runtime changed during goal preparation; confirm the goal again', 409)
+    requireCondition(this.loadedCodeStamp === runtimeCodeStamp() && this.snapshot().inspection && launchStamp(this.stateDir, this.snapshot().inspection!.executable.realpath) === this.stamp, 'RUNTIME_FINGERPRINT_CHANGED', 'Runtime changed during goal preparation', 409)
+    if (status.canDispatch) return
+    const repositoryId = this.state().repositoryId
+    const preview = this.preview('enable', { expectedRevision, repositoryId })
+    this.enable({ requestId: randomUUID(), expectedRevision, repositoryId, confirmation: repositoryId, reviewId: preview.reviewId, mode: 'restricted_local', expectedFingerprint, verificationId: preview.verificationId, reason: `Restricted execution authorized with goal ${planId}` })
   }
   disable(raw: unknown) {
     const params = disableRequestSchema.parse(raw)

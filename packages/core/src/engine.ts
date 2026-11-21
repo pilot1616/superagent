@@ -3,6 +3,8 @@ import { z } from 'zod'
 import type { Persistence, RuntimeGate } from './ports.js'
 import { Coordination, coordinationTools } from './coordination.js'
 import { scheduling, validInputs } from './scheduler.js'
+import { retryBudget } from './retry.js'
+import { workspaceTools } from './workspace.js'
 import type { Plan, WorkerAgent } from './model.js'
 import { DomainError, latestAssignment, requireCondition, stage, type Approval, type Binding, type Checkpoint, type Effect, type Report, type Ticket, type PublishPreview, type MergeRequest } from './model.js'
 
@@ -10,6 +12,7 @@ const identifier = z.string().min(1).max(150)
 const requestId = z.string().min(8).max(150)
 const versioned = { ticketId: identifier, expectedRevision: z.number().int().positive(), requestId }
 export const tools = {
+  ...workspaceTools,
   ...coordinationTools,
   task_create: z.object({ repositoryId: identifier, title: z.string().trim().min(1).max(160), request: z.string().trim().min(1).max(30_000), requestId }).strict(),
   task_get: z.object({ ticketId: identifier, cursor: z.number().int().nonnegative().default(0), checkpointCursor: z.number().int().nonnegative().default(0) }).strict(),
@@ -38,8 +41,9 @@ export class Engine {
   }
   view(ticket: Ticket) {
     const approvals = this.store.approvals(ticket.id).filter(approval => approval.status === 'pending' && approval.expiresAt > now())
+    const plan = ticket.planId ? this.store.entity<Plan>('plan', ticket.planId) : undefined
     const agents = this.store.entities<WorkerAgent>('worker_agent').filter(agent => agent.ticketId === ticket.id).sort((left, right) => right.createdAt.localeCompare(left.createdAt)).slice(0, 64).map(agent => ({ ...agent, historical: agent.assignmentId !== latestAssignment(ticket)?.id }))
-    return { ticket, stage: stage(ticket, approvals), scheduling: this.decision(ticket), agents, approvals: approvals.map(({ id, kind, expiresAt, details }) => ({ id, kind, expiresAt, details })) }
+    return { ticket, stage: stage(ticket, approvals), scheduling: this.decision(ticket), planAuthorized: plan ? plan.grant?.version === plan.version && !plan.held && !plan.completed && Date.parse(plan.expiresAt) > Date.now() : undefined, retryBudget: retryBudget(this.store, ticket), agents, approvals: approvals.map(({ id, kind, expiresAt, details }) => ({ id, kind, expiresAt, details })) }
   }
   decision(ticket: Ticket, active: ReadonlySet<string> = new Set()) {
     const decision = scheduling(this.store, ticket, active)
@@ -92,6 +96,7 @@ export class Engine {
     this.store.saveEffect({ key: assignment.id, kind: 'launch', ticketId: ticket.id, generation: assignment.generation, payload: {}, state: 'pending', attempts: 0, dueAt: Date.now() })
   }
   call(name: keyof typeof tools, raw: unknown): unknown {
+    requireCondition(!Object.hasOwn(workspaceTools, name), 'INVALID_STATE', 'Workspace operations require the project workspace service')
     this.expireApprovals()
     if (Object.hasOwn(coordinationTools, name)) return this.coordination.call(name as keyof typeof coordinationTools, raw)
     const parsed = tools[name].parse(raw) as any
@@ -105,7 +110,7 @@ export class Engine {
       const rows = this.store.tickets().map(ticket => this.view(ticket)).filter(row => (!parsed.stage || row.stage === parsed.stage) && (!parsed.planId || row.ticket.planId === parsed.planId) && row.ticket.title.toLocaleLowerCase().includes(parsed.query.toLocaleLowerCase())).sort((left, right) => right.ticket.updatedAt.localeCompare(left.ticket.updatedAt) || left.ticket.id.localeCompare(right.ticket.id))
       const awaitingAcceptance = (row: ReturnType<Engine['view']>) => !row.ticket.result && row.ticket.report?.state === 'ready' && row.ticket.ended !== 'stopped' && (!row.ticket.ended || !!row.ticket.planId || row.ticket.mergeRequest?.state === 'merged')
       const active = (row: ReturnType<Engine['view']>) => !row.ticket.ended || awaitingAcceptance(row)
-      const attention = (row: ReturnType<Engine['view']>) => ['draft', 'approval', 'answer', 'blocked', 'failed', 'reconciling', 'review'].includes(row.stage) || !!row.ticket.mandate.humanHold || awaitingAcceptance(row)
+      const attention = (row: ReturnType<Engine['view']>) => ['draft', 'approval', 'answer', 'blocked', 'failed', 'reconciling', 'review'].includes(row.stage) || row.scheduling.state === 'waiting_workspace' || !!row.ticket.mandate.humanHold || awaitingAcceptance(row)
       const matches = (row: ReturnType<Engine['view']>) => parsed.view === 'all' || (parsed.view === 'finished' ? !active(row) : parsed.view === 'active' ? active(row) : active(row) && attention(row))
       const filtered = rows.filter(matches)
       const conclusions = new Map<string, Checkpoint>()
@@ -113,7 +118,7 @@ export class Engine {
       return { items: filtered.slice(parsed.cursor, parsed.cursor + parsed.limit).map(row => {
         const conclusion = conclusions.get(row.ticket.id)
         const historical = conclusion && this.historicalCheckpoint(row.ticket, conclusion)
-        return { id: row.ticket.id, title: row.ticket.title, revision: row.ticket.revision, stage: row.stage, scheduling: row.scheduling, planId: row.ticket.planId, updatedAt: row.ticket.updatedAt, awaitingAcceptance: awaitingAcceptance(row), summary: `${historical ? '历史结论：' : ''}${conclusion?.summary ?? row.ticket.report?.summary ?? ''}`.slice(0, 240) }
+        return { id: row.ticket.id, title: row.ticket.title, revision: row.ticket.revision, stage: row.stage, scheduling: row.scheduling, planId: row.ticket.planId, updatedAt: row.ticket.updatedAt, awaitingAcceptance: awaitingAcceptance(row), acceptedBy: row.ticket.result ? row.ticket.result.acceptedBy ?? 'human' : undefined, summary: `${historical ? '历史结论：' : ''}${conclusion?.summary ?? row.ticket.report?.summary ?? ''}`.slice(0, 240) }
       }), total: filtered.length, counts: { all: rows.length, active: rows.filter(active).length, finished: rows.filter(row => !active(row)).length, attention: rows.filter(row => active(row) && attention(row)).length }, nextCursor: parsed.cursor + parsed.limit < filtered.length ? parsed.cursor + parsed.limit : null }
     }
     return this.store.once(this.operatorId, name, parsed.requestId, parsed, () => {
@@ -155,14 +160,15 @@ export class Engine {
       const kind = name.slice(5) as Approval['kind']
       if (kind === 'start') requireCondition(stage(ticket) === 'draft', 'INVALID_STATE', 'Only draft tasks can start')
       if (kind === 'resume') requireCondition(ticket.ended === 'stopped' || stage(ticket) === 'waiting' || stage(ticket) === 'answer', 'INVALID_STATE', 'Only stopped or idle tasks can resume')
-      if (kind === 'retry') requireCondition(['failed', 'blocked'].includes(stage(ticket)), 'INVALID_STATE', 'Only failed or blocked tasks can retry')
+      if (kind === 'retry') requireCondition(['failed', 'blocked'].includes(stage(ticket)) || (stage(ticket) === 'answer' && ticket.report?.state === 'blocked'), 'INVALID_STATE', 'Only failed or blocked tasks can retry')
       if (kind === 'retry' && ticket.planId) {
         const plan = this.coordination.require<Plan>('plan', ticket.planId)
-        requireCondition(plan.grant?.version === plan.version && !plan.held && !ticket.mandate.humanHold && Date.parse(plan.expiresAt) > Date.now(), 'APPROVAL_REQUIRED', 'Retry needs a current, unheld plan authorization')
-        requireCondition((latestAssignment(ticket)?.generation ?? 0) < plan.maxAttempts, 'BUDGET_EXHAUSTED', 'Plan assignment budget exhausted; do not expand the executed plan implicitly')
+        requireCondition(plan.grant?.version === plan.version && !plan.held && !plan.completed && !ticket.mandate.humanHold && Date.parse(plan.expiresAt) > Date.now(), 'APPROVAL_REQUIRED', 'Retry needs a current, unheld plan authorization')
         requireCondition(!this.store.approvals(ticket.id).some(approval => approval.status === 'pending'), 'INVALID_STATE', 'Resolve the pending task approval first')
-        this.queue(ticket); this.save(ticket, 'plan.retry_requested', { planId: plan.id })
-        return this.view(ticket)
+        if ((latestAssignment(ticket)?.generation ?? 0) < plan.maxAttempts) {
+          this.queue(ticket); this.save(ticket, 'plan.retry_requested', { planId: plan.id })
+          return this.view(ticket)
+        }
       }
       if (kind === 'publish') requireCondition(!ticket.ended && !ticket.mandate.humanHold && ticket.report?.state === 'ready' && latestAssignment(ticket)?.state === 'ended' && !this.store.effects().some(effect => effect.ticketId === ticket.id && effect.kind === 'publish' && effect.state !== 'done'), 'INVALID_STATE', 'Only ready, idle tasks without an ongoing publication may publish')
       if (kind === 'publish') requireCondition(validInputs(this.store, ticket), 'REVISION_CONFLICT', 'Dependency results changed')
@@ -171,8 +177,11 @@ export class Engine {
         requireCondition(plan.grant?.version === plan.version && !plan.held && !plan.completed && Date.parse(plan.expiresAt) > Date.now(), 'APPROVAL_REQUIRED', 'Approve the current plan before requesting member execution')
       }
       requireCondition(!this.store.approvals(ticket.id).some(approval => approval.status === 'pending'), 'INVALID_STATE', 'Resolve the pending approval first')
+      const plan = ticket.planId ? this.coordination.require<Plan>('plan', ticket.planId) : undefined
+      const budget = retryBudget(this.store, ticket)
+      const extension = plan && budget?.requiresApproval && ['retry', 'resume'].includes(kind) ? { extraAttempt: true, planId: plan.id, planVersion: plan.version, planFingerprint: plan.grant!.fingerprint, baseAttempts: budget.baseAttempts, assigned: budget.assigned, generation: budget.nextGeneration } : {}
       this.save(ticket, 'authorization.requested', { kind })
-      const approval: Approval = { id: randomUUID(), ticketId: ticket.id, kind, status: 'pending', createdAt: now(), expiresAt: new Date(Date.now() + 15 * 60_000).toISOString(), revision: ticket.revision, details: kind === 'publish' ? { headSha: parsed.headSha, scope: ticket.scope } : { scope: ticket.scope } }
+      const approval: Approval = { id: randomUUID(), ticketId: ticket.id, kind, status: 'pending', createdAt: now(), expiresAt: new Date(Date.now() + 15 * 60_000).toISOString(), revision: ticket.revision, details: kind === 'publish' ? { headSha: parsed.headSha, scope: ticket.scope } : { scope: ticket.scope, ...extension } }
       this.store.saveApproval(approval)
       return this.view(ticket)
     })
@@ -226,11 +235,27 @@ export class Engine {
       if (accept) this.revision(ticket, approval.revision)
       if (accept) {
         if (approval.kind === 'publish') throw new DomainError('APPROVAL_REQUIRED', 'Use the publish preview command to approve a specific diff')
+        if (ticket.planId) {
+          const plan = this.coordination.require<Plan>('plan', ticket.planId)
+          requireCondition(plan.grant?.version === plan.version && !plan.held && !plan.completed && Date.parse(plan.expiresAt) > Date.now(), 'APPROVAL_REQUIRED', 'Execution needs the current, unexpired goal authorization')
+        }
+        if (approval.details.extraAttempt === true) {
+          const plan = ticket.planId ? this.coordination.require<Plan>('plan', ticket.planId) : undefined
+          requireCondition(plan && ['retry', 'resume'].includes(approval.kind) && plan.grant?.version === plan.version && !plan.held && !plan.completed && Date.parse(plan.expiresAt) > Date.now() && approval.details.planId === plan.id && approval.details.planVersion === plan.version && approval.details.planFingerprint === plan.grant.fingerprint, 'APPROVAL_REQUIRED', 'Additional attempt needs the same current, unheld plan authorization')
+          requireCondition(!ticket.stopping && !ticket.reconciliation && !ticket.result && latestAssignment(ticket)?.state === 'ended' && approval.details.generation === latestAssignment(ticket)!.generation + 1, 'REVISION_CONFLICT', 'Additional attempt no longer matches the next settled assignment')
+        }
         ticket.mandate.executionGranted = true
         ticket.mandate.humanHold = false
         delete ticket.ended
         if (ticket.result) ticket.ended = 'completed'
-        else this.queue(ticket)
+        else {
+          this.queue(ticket)
+          if (approval.details.extraAttempt === true) {
+            latestAssignment(ticket)!.retryApprovalId = approval.id
+            approval.assignmentId = latestAssignment(ticket)!.id
+            this.store.audit(ticket.id, 'retry.additional_attempt_authorized', { approvalId: approval.id, assignmentId: approval.assignmentId, generation: latestAssignment(ticket)!.generation, planId: ticket.planId })
+          }
+        }
       }
       approval.status = accept ? 'accepted' : 'declined'
       this.store.saveApproval(approval)
@@ -307,7 +332,9 @@ export class Engine {
       for (const approval of this.store.approvals()) {
         if (approval.status !== 'pending' || approval.kind === 'runtime') continue
         const revision = approval.kind === 'plan' ? this.store.entity<Plan>('plan', approval.ticketId)?.revision : this.require(approval.ticketId).revision
-        if (approval.expiresAt <= now() || revision !== approval.revision) {
+        const plan = approval.details.extraAttempt === true ? this.store.entity<Plan>('plan', String(approval.details.planId)) : undefined
+        const staleExtension = approval.details.extraAttempt === true && (!plan || plan.version !== approval.details.planVersion || plan.grant?.version !== plan.version || plan.grant.fingerprint !== approval.details.planFingerprint || plan.held || plan.completed || Date.parse(plan.expiresAt) <= Date.now())
+        if (approval.expiresAt <= now() || revision !== approval.revision || staleExtension) {
           this.store.saveApproval({ ...approval, status: 'expired' })
           this.store.audit(approval.ticketId, 'authorization.expired', { approvalId: approval.id })
         }
@@ -430,16 +457,22 @@ export class Engine {
     return this.store.atomic(() => {
       const ticket = this.require(ticketId)
       const assignment = latestAssignment(ticket)
-      if (!assignment || assignment.id !== assignmentId || assignment.state !== 'running' || ['turn_sending', 'turn_acknowledged', 'cleanup', 'ended'].includes(assignment.launchPhase ?? '')) return false
-      assignment.state = 'pending'
+      if (!assignment || assignment.id !== assignmentId || assignment.state !== 'running' || ticket.reconciliation || ['turn_sending', 'turn_acknowledged', 'cleanup', 'ended'].includes(assignment.launchPhase ?? '')) return false
+      const effect = this.store.effects('running').find(entry => entry.key === assignment.id)
+      const failures = Number(effect?.payload.preparationFailures ?? 0) + 1
+      assignment.state = failures >= 3 ? 'ended' : 'pending'
       assignment.launchPhase = 'claimed'
       delete assignment.startedAt
       delete assignment.runtimeFingerprint
       delete assignment.runtimeFence
       delete assignment.enablementId
       for (const input of ticket.inputs) if (input.state === 'sending') input.state = 'pending'
-      for (const effect of this.store.effects('running')) if (effect.key === assignment.id) this.store.saveEffect({ ...effect, state: 'pending', attempts: Math.max(0, effect.attempts - 1), lease: undefined })
-      this.save(ticket, 'execution.preparation_cancelled', { assignmentId })
+      if (failures >= 3) {
+        assignment.launchPhase = 'ended'; assignment.endedAt = now()
+        ticket.failure = 'Execution preparation failed three times before model delivery; inspect the environment and explicitly retry.'
+      }
+      if (effect) this.store.saveEffect({ ...effect, state: failures >= 3 ? 'done' : 'pending', payload: { ...effect.payload, preparationFailures: failures }, dueAt: Date.now() + Math.min(30_000, 1000 * 2 ** (failures - 1)), lease: undefined })
+      this.save(ticket, 'execution.preparation_cancelled', { assignmentId, preparationFailures: failures, exhausted: failures >= 3 })
       return true
     })
   }

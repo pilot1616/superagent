@@ -53,7 +53,7 @@ test('Worker environment excludes inherited secrets and detects edited configura
   const root = await realpath(await mkdtemp(join(tmpdir(), 'sa-profile-')))
   try {
     const profile = await createProfile(root, 'explicit-test-model')
-    assert.deepEqual(Object.keys(workerEnvironment(profile)).sort(), ['CODEX_HOME', 'HOME', 'LANG', 'PATH', 'TMPDIR'])
+    assert.deepEqual(Object.keys(workerEnvironment(profile)).sort(), [...new Set(['CODEX_HOME', 'GIT_OPTIONAL_LOCKS', 'HOME', 'LANG', 'PATH', 'TMPDIR', ...Object.keys(profile.capabilities?.toolchain.environment ?? {})])].sort())
     assert.equal((await loadProfile(root)).hash, profile.hash)
     await writeFile(join(profile.home, '.codex/config.toml'), 'approval_policy="never"')
     await assert.rejects(() => loadProfile(root), /configuration changed/)

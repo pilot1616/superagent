@@ -8,6 +8,8 @@ import { Engine } from '../core/src/engine.js'
 import { latestAssignment, type Ticket } from '../core/src/model.js'
 import { configSchema, initialize, migrateConfig, readConfig, acquireLock } from '../service/src/config.js'
 import { RuntimeController } from '../service/src/runtime.js'
+import { WorkflowController } from '../service/src/workflow.js'
+import { TaskMaterials } from '../service/src/materials.js'
 import { RuntimeVerificationService } from '../service/src/runtime-verification.js'
 import { createProfile, loadProfile, canonicalJson, providerSchema } from '../executor-codex/src/profile.js'
 import { evaluateRuntime, executionVerified } from '../executor-codex/src/acceptance.js'
@@ -28,12 +30,13 @@ async function fixture() {
   const config = configSchema.parse({ version: 3, operatorId: 'human', concurrency: 2, runtime: {} })
   let inspections = 0
   let authenticated = true
-  const runtime = new RuntimeController(store, root, config, async (_state, repositoryId, generation, ttlSeconds) => {
+  const inspect: NonNullable<ConstructorParameters<typeof RuntimeController>[3]> = async (_state, repositoryId, generation, ttlSeconds) => {
     inspections++
     const currentProfile = await loadProfile(root)
     const now = Date.now()
     return inspectionSchema.parse({ id: randomUUID(), repositoryId, checkedAt: new Date(now).toISOString(), validUntil: new Date(now + ttlSeconds * 1000).toISOString(), fingerprint: sha256(canonicalJson({ profile: currentProfile.hash, generation, fixture: true })), executable: { realpath: process.execPath, version: 'fixture', sha256: sha256('fixture-binary') }, platform: { os: process.platform, release: 'fixture', arch: process.arch }, runtimeBuildHash: sha256('fixture-build'), protocolSchemaHash: sha256('fixture-protocol'), profileHash: currentProfile.hash, policyHash: sha256('fixture-policy'), model: currentProfile.model, provider: { id: 'openai', authMode: 'openai' }, auth: { status: authenticated ? 'configured' : 'missing', generation }, checks: [{ key: 'auth', status: authenticated ? 'passed' : 'failed', reasonCode: authenticated ? undefined : 'AUTH_REQUIRED' }] })
-  })
+  }
+  const runtime = new RuntimeController(store, root, config, inspect)
   const engine = new Engine(store, 'human', undefined, runtime)
   function task(approved = true) {
     const { ticket } = engine.call('task_create', { repositoryId: 'fixture', title: 'Synthetic gate regression', request: 'No real model or real evidence', requestId: randomUUID() }) as { ticket: Ticket }
@@ -57,8 +60,81 @@ async function fixture() {
     const params = { requestId: randomUUID(), expectedRevision: preview.expectedRevision, repositoryId: 'fixture', confirmation: 'fixture', reviewId: preview.reviewId, mode: 'restricted_local', verificationId: preview.verificationId, expectedFingerprint: preview.expectedFingerprint, reason: 'Synthetic regression only, not runtime acceptance' }
     return { params, result: runtime.enable(params) }
   }
-  return { root, profile, store, config, runtime, engine, task, verified, enable, inspections: () => inspections, setAuthenticated: (value: boolean) => { authenticated = value }, async close() { store.close(); await rm(root, { recursive: true, force: true }) } }
+  return { root, profile, store, config, runtime, engine, task, verified, enable, restart: () => new RuntimeController(store, root, config, inspect), inspections: () => inspections, setAuthenticated: (value: boolean) => { authenticated = value }, async close() { store.close(); await rm(root, { recursive: true, force: true }) } }
 }
+
+test('goal runtime authorization survives a clean restart only after a matching fresh inspection', async () => {
+  const context = await fixture()
+  try {
+    await context.runtime.check()
+    context.enable()
+    const original = context.runtime.snapshot().enablement!
+    const previousFence = context.runtime.state().fence
+    const restarted = context.restart()
+    assert.equal(restarted.status().canDispatch, false)
+    assert.ok(restarted.state().fence > previousFence)
+    await restarted.check()
+    assert.equal(restarted.status().canDispatch, true)
+    assert.equal(restarted.snapshot().enablement!.id, original.id)
+    assert.equal(restarted.snapshot().enablement!.expiresAt, original.expiresAt)
+    assert.notEqual(restarted.snapshot().enablement!.daemonEpoch, original.daemonEpoch)
+  } finally { await context.close() }
+})
+
+test('one trusted goal confirmation inspects and enables the runtime and authorizes its DAG atomically', async () => {
+  const context = await fixture()
+  try {
+    const materials = new TaskMaterials(context.root, context.store, context.engine, () => new Map())
+    const workflow = new WorkflowController(context.store, context.engine, materials, context.runtime)
+    const { plan } = context.engine.call('plan_create', { repositoryId: 'fixture', title: 'Unified confirmation', tasks: [{ key: 'final', title: 'Final output', request: 'Synthetic only' }], dependencies: [], integrationKey: 'final', expiresAt: new Date(Date.now() + 3600_000).toISOString(), requestId: randomUUID() }) as { plan: import('../core/src/model.js').Plan }
+    assert.equal(context.runtime.status().canDispatch, false)
+    const input = { action: 'plan_start', params: { planId: plan.id, expectedRevision: plan.revision, requestId: randomUUID() } }
+    await workflow.control(input)
+    assert.equal(context.runtime.status().canDispatch, true)
+    const enablement = context.runtime.snapshot().enablement!
+    assert.match(enablement.reason, /goal/)
+    assert.equal(context.engine.decision(context.engine.require(plan.integrationId)).state, 'ready')
+    await workflow.control(input)
+    assert.equal(context.runtime.snapshot().enablement!.id, enablement.id)
+    assert.equal(context.engine.require(plan.integrationId).assignments.length, 1)
+  } finally { await context.close() }
+})
+
+test('settled pre-turn failures suspend dispatch until reinspection without extending human authorization', async () => {
+  const context = await fixture()
+  try {
+    await context.runtime.check(); context.enable()
+    const original = context.runtime.snapshot().enablement!
+    context.runtime.recheck()
+    assert.equal(context.runtime.status().canDispatch, false)
+    await context.runtime.check()
+    assert.equal(context.runtime.status().canDispatch, true)
+    assert.equal(context.runtime.snapshot().enablement!.id, original.id)
+    assert.equal(context.runtime.snapshot().enablement!.expiresAt, original.expiresAt)
+    context.setAuthenticated(false)
+    context.runtime.recheck(); await context.runtime.check()
+    assert.equal(context.runtime.status().canDispatch, false)
+  } finally { await context.close() }
+})
+
+test('restart never restores expired, disabled, mismatched, quarantined or uncertain runtime authorization', async () => {
+  for (const scenario of ['expired', 'disabled', 'mismatched', 'quarantined', 'uncertain', 'unauthenticated']) {
+    const context = await fixture()
+    try {
+      await context.runtime.check(); context.enable()
+      const original = context.runtime.snapshot().enablement!
+      if (scenario === 'expired') context.store.saveEntity('runtime_enablement', original.id, { ...original, expiresAt: new Date(Date.now() - 1).toISOString() })
+      if (scenario === 'disabled') context.runtime.disable({ requestId: randomUUID(), expectedRevision: context.runtime.state().revision, repositoryId: 'fixture', confirmation: 'fixture', mode: 'drain', reason: 'Human disabled execution' })
+      if (scenario === 'mismatched') context.store.saveEntity('runtime_enablement', original.id, { ...original, fingerprint: '0'.repeat(64) })
+      if (scenario === 'quarantined') context.runtime.quarantine('TEST_UNCERTAINTY', [])
+      if (scenario === 'uncertain') { const ticket = context.task(); ticket.reconciliation = 'Inspect previous execution'; context.store.save(ticket) }
+      if (scenario === 'unauthenticated') context.setAuthenticated(false)
+      const restarted = context.restart()
+      await restarted.check()
+      assert.equal(restarted.status().canDispatch, false, scenario)
+    } finally { await context.close() }
+  }
+})
 
 test('T01/T03: approved work remains pending without environment inspection or authorization', async () => {
   const context = await fixture()
@@ -245,9 +321,11 @@ test('T06: disabling after claim fences the permit and rolls back only the pre-t
     assert.throws(() => context.runtime.validate(permit), /permit expired/)
     assert.equal(context.engine.cancelPreparation(ticket.id, assignment.id), true)
     assert.equal(latestAssignment(context.engine.require(ticket.id))!.generation, 1)
-    assert.equal(context.store.effects('pending')[0]!.attempts, 0)
+    assert.equal(context.store.effects('pending')[0]!.payload.preparationFailures, 1)
+    assert.ok(context.store.effects('pending')[0]!.dueAt > Date.now())
     assert.equal(context.engine.require(ticket.id).inputs[0]!.state, 'pending')
     context.enable()
+    context.store.saveEffect({ ...context.store.effects('pending')[0]!, dueAt: 0 })
     const restarted = context.engine.claim(context.store.effects('pending')[0]!)!
     context.engine.updateExecution(ticket.id, latestAssignment(restarted)!.id, current => { latestAssignment(current)!.launchPhase = 'turn_sending' }, 'fixture.turn_sending')
     assert.equal(context.engine.cancelPreparation(ticket.id, assignment.id), false)
@@ -287,7 +365,7 @@ test('quarantine blocks execution and human reconciliation discards old verifica
     await context.verified(); context.enable()
     context.runtime.quarantine('PROCESS_CLEANUP_UNCERTAIN', ['synthetic-assignment'])
     assert.equal(context.runtime.status().phase, 'quarantined')
-    const result = context.runtime.reconcile({ requestId: randomUUID(), expectedRevision: context.runtime.state().revision, repositoryId: 'fixture', confirmation: 'fixture', reason: 'Human inspected the synthetic process fixture and its state' })
+    const result = await context.runtime.reconcile({ requestId: randomUUID(), expectedRevision: context.runtime.state().revision, repositoryId: 'fixture', confirmation: 'fixture', reason: 'Human inspected the synthetic process fixture and its state' })
     assert.equal(result.canDispatch, false)
     assert.equal(result.verification, undefined)
     assert.equal(context.runtime.state().quarantine, undefined)

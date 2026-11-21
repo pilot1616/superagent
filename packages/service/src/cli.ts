@@ -11,6 +11,7 @@ import { defaultProjectsRoot, writePrivateJson, configureProjects } from './proj
 import { startPanel } from './panel.js'
 import { requireCondition } from '../../core/src/model.js'
 import { recoverPanel } from './panel-token.js'
+import { deletionSchemas } from '../../core/src/deletion.js'
 
 const HELP = `superagent-local — local single-repository multi-task coordination service
 
@@ -25,6 +26,10 @@ runtime verification RUN_ID                Read an evidence-backed verification 
 runtime cancel-verification RUN_ID --json '{...}'  Cancel a bounded verification
 runtime migrate                            Offline v2 -> v3 configuration migration with SQLite backup
 runtime configure-profile --json '{model,provider}'  Offline explicit Worker model/provider selection; no credentials
+runtime configure-capabilities --json '{skills,toolchain}'  Offline reviewed skill snapshots and toolchain; no credentials
+materials preview|attach|list --json '{...}'  Human-reviewed task-local read-only reference files
+workspace preview|configure|prepare --json '{...}'  Plan baseline preview, human migration, or worktree recheck
+task delete | plan delete --json '{...}'    Interactive deletion; keeps audit, worktrees and files
 answer REQUEST_ID --json '{...}'             Answer current Worker questions, never expand permissions
 panel [--port NUMBER] [--token-file PATH]   Local approval/control dashboard; private login token
 task OPERATION --json '{...}'               Public task operation; requestId required for writes
@@ -124,6 +129,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   if (command === 'recover-panel') { await confirm('Inspect the panel owner and recover only this stopped instance; never kill a reused PID.', 'recover-panel'); await recoverPanel(state); print({ recovered: true }); return }
   if (command === 'runtime') {
     if (identifier === 'configure-profile') { const params = JSON.parse(values.json ?? '{}'); await confirm(JSON.stringify(params, null, 2), 'configure-profile'); print(await configureWorkerProfile(state, params)); return }
+    if (identifier === 'configure-capabilities') { const params = JSON.parse(values.json ?? '{}'); await confirm(JSON.stringify(params, null, 2), 'configure-capabilities'); print(await configureWorkerProfile(state, params, true)); return }
     if (identifier === 'migrate') { await confirm('Back up and migrate this stopped project state; no Worker will be enabled.', 'migrate'); await migrateConfig(state); print({ migrated: true, executionEnabled: false }); return }
     const methods: Record<string, string> = { status: 'runtime-status', check: 'runtime-check', 'verify-preview': 'runtime-verify-preview', verify: 'runtime-verify', verification: 'runtime-verification-get', 'cancel-verification': 'runtime-verification-cancel', 'enable-preview': 'runtime-enable-preview', enable: 'runtime-enable', 'disable-preview': 'runtime-disable-preview', disable: 'runtime-disable', reconcile: 'runtime-reconcile' }
     requireCondition(identifier && methods[identifier], 'INVALID_REQUEST', 'Unknown runtime operation')
@@ -133,6 +139,13 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     const result = await invoke(state, 'admin', methods[identifier]!, params)
     print(result); if (!result.ok) process.exitCode = 1; return
   }
+  if (command === 'materials') {
+    requireCondition(identifier && ['preview', 'attach', 'list'].includes(identifier), 'INVALID_REQUEST', 'Specify materials preview, attach or list')
+    const params = JSON.parse(values.json ?? '{}')
+    if (identifier === 'attach') { await confirm(JSON.stringify(params, null, 2), params.ticketId); params.confirmation = params.ticketId }
+    const result = await invoke(state, 'admin', `task-materials-${identifier}`, params)
+    print(result); if (!result.ok) process.exitCode = 1; return
+  }
   if (command === 'answer') {
     const params = JSON.parse(values.json ?? '{}')
     params.id = identifier
@@ -140,7 +153,26 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     params.confirmation = identifier
     print(await invoke(state, 'admin', 'runtime-answer', params)); return
   }
+  if (command === 'workspace') {
+    const methods: Record<string, string> = { preview: 'plan_workspace_preview', configure: 'plan-workspace-configure', prepare: 'task_workspace_prepare' }
+    requireCondition(identifier && methods[identifier], 'INVALID_REQUEST', 'Specify workspace preview, configure or prepare')
+    const params = JSON.parse(values.json ?? '{}')
+    if (identifier === 'configure') {
+      const preview = await invoke(state, 'admin', 'plan-workspace-review', { planId: params.planId, previewId: params.previewId })
+      requireCondition(preview.ok, 'REVISION_CONFLICT', 'Preview is stale; generate a new workspace preview')
+      await confirm(`Preserve old files and branches, invalidate authorization and use a new workspace binding.\n${JSON.stringify(preview.data, null, 2)}`, params.planId); params.confirmation = params.planId
+    }
+    print(await invoke(state, identifier === 'configure' ? 'admin' : 'bridge', methods[identifier]!, params)); return
+  }
   if (command === 'recover-lock') { await confirm('Confirm the old daemon is dead. This does not resolve uncertain tasks or kill processes.', 'recover-lock'); await recoverLock(state); print({ recovered: true }); return }
+  if ((command === 'task' || command === 'plan') && identifier === 'delete') {
+    const action = command === 'task' ? 'delete-task' : 'delete-plan'
+    const params = deletionSchemas[action].parse(JSON.parse(values.json ?? '{}'))
+    const target = 'ticketId' in params ? params.ticketId : params.planId
+    await confirm(`Delete these records from active lists and scheduling. Audit snapshots, files, worktrees and remote MRs are retained. There is no UI undo.\n${JSON.stringify(params, null, 2)}`, target)
+    const result = await invoke(state, 'admin', action, params)
+    print(result); if (!result.ok) process.exitCode = 1; return
+  }
   if (['task', 'plan', 'thread', 'event', 'route'].includes(command)) {
     requireCondition(identifier && /^[a-z_]+$/.test(identifier), 'INVALID_REQUEST', 'Specify create, list, get, message, start, stop, retry, resume or publish')
     const result = await invoke(state, 'bridge', `${command}_${identifier}`, JSON.parse(values.json ?? '{}'))

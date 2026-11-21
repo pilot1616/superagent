@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { requireCondition, type PublishPreview, type Repository, type Ticket } from '../../core/src/model.js'
 import { validateGitLabProject } from '../../core/src/gitlab.js'
 import { digest } from '../../storage/src/store.js'
+import { workspaceRepository } from '../../core/src/workspace.js'
 import { inside, inspectWorkspace } from '../../service/src/workspace.js'
 
 const execute = promisify(execFile)
@@ -18,7 +19,9 @@ async function checkRepository(repository: Repository, ticket: Ticket): Promise<
   requireCondition(repository.gitlab && ticket.workspace && ticket.branch && ticket.baseSha, 'INVALID_STATE', 'GitLab repository and managed workspace are required')
   validateGitLabProject(repository.gitlab)
   requireCondition(!['HEAD', 'FETCH_HEAD'].includes(repository.baseRef) && !repository.baseRef.startsWith('refs/'), 'INVALID_STATE', 'Register a named GitLab base branch, such as main, before publishing')
-  requireCondition(await realpath(ticket.workspace) === join(await realpath(repository.executionRoot), ticket.id), 'FORBIDDEN', 'Workspace does not match its registered root')
+  const binding = ticket.workspaceBinding
+  requireCondition(await realpath(ticket.workspace) === join(await realpath(repository.executionRoot), binding ? `${ticket.id}-${binding.id}` : ticket.id), 'FORBIDDEN', 'Workspace does not match its registered root')
+  if (binding) requireCondition(ticket.branch === `${binding.branchPrefix}/${binding.id}/${ticket.id}` && ticket.baseSha === binding.baseSha, 'FORBIDDEN', 'Workspace does not match its plan binding')
   const configuration = await deliveryGit(ticket.workspace, ['config', '--local', '--list'])
   requireCondition(!/^(?:filter\.|url\.|include\.|includeif\.|credential\.|http\.|core\.(?:sshcommand|gitproxy|attributesfile|fsmonitor)|extensions\.worktreeconfig)/im.test(configuration), 'FORBIDDEN', 'Unsafe or unsupported local Git configuration; publication requires manual review')
   const pointer = await readFile(join(ticket.workspace, '.git'), 'utf8')
@@ -28,6 +31,7 @@ async function checkRepository(repository: Repository, ticket: Ticket): Promise<
   requireCondition(await deliveryGit(ticket.workspace, ['remote', 'get-url', 'origin']) === repository.remote, 'FORBIDDEN', 'Registered remote changed')
 }
 export async function previewWorkspace(repository: Repository, ticket: Ticket, state: string, authorName: string, authorEmail: string): Promise<PublishPreview> {
+  repository = workspaceRepository(repository, ticket)
   requireCondition(authorName.length > 0 && authorName.length <= 100 && !/[\r\n<>]/.test(authorName) && /^[^\s<>@]+@[^\s<>@]+$/.test(authorEmail), 'INVALID_REQUEST', 'Provide an explicit valid commit author name and email')
   await checkRepository(repository, ticket)
   const inspected = await inspectWorkspace(ticket)

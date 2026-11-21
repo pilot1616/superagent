@@ -7,7 +7,8 @@ export async function invoke(state: string, role: 'bridge' | 'admin', method: st
   const token = (await readFile(join(state, `${role}.token`), 'utf8')).trim()
   const payload = JSON.stringify({ method, params })
   return new Promise((resolve, reject) => {
-    const connection = request({ socketPath: join(state, 'service.sock'), path: '/rpc', method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) }, timeout: 15_000 }, response => {
+    const timeout = ['plan_workspace_preview', 'plan-workspace-configure', 'task_workspace_prepare'].includes(method) ? 120_000 : 15_000
+    const connection = request({ socketPath: join(state, 'service.sock'), path: '/rpc', method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) }, timeout }, response => {
       let data = ''
       response.setEncoding('utf8')
       response.on('data', chunk => { data += chunk; if (Buffer.byteLength(data) > 8_000_000) connection.destroy(new Error('Service response too large')) })

@@ -8,6 +8,7 @@ import { backup } from 'node:sqlite'
 import { Store } from '../../storage/src/store.js'
 import { DomainError, requireCondition } from '../../core/src/model.js'
 import { createProfile, providerSchema, workerAgentsSchema } from '../../executor-codex/src/profile.js'
+import { capabilitiesInputSchema, prepareCapabilities } from '../../executor-codex/src/capabilities.js'
 import { inside, registerRepository } from './workspace.js'
 
 export const defaultState = () => resolve(process.env.SUPERAGENT_STATE_DIR ?? join(homedir(), '.local/state/codex-superagent'))
@@ -61,19 +62,22 @@ export async function migrateConfig(state: string): Promise<void> {
     await import('node:fs/promises').then(fs => fs.rename(temporary, join(state, 'service.json')))
   } finally { store.close(); await lock.release() }
 }
-export async function configureWorkerProfile(state: string, raw: unknown) {
+export async function configureWorkerProfile(state: string, raw: unknown, capabilitiesOnly = false) {
   await readConfig(state)
-  const params = z.object({ model: z.string().min(1).max(200), provider: providerSchema, agents: workerAgentsSchema.optional() }).strict().parse(raw)
+  const input = capabilitiesOnly ? capabilitiesInputSchema.parse(raw) : z.object({ model: z.string().min(1).max(200), provider: providerSchema, agents: workerAgentsSchema.optional() }).strict().parse(raw)
   const lock = await acquireLock(state)
   const store = new Store(join(state, 'tasks.sqlite'))
   try {
     requireCondition(!store.tickets().some(ticket => ticket.stopping || ticket.reconciliation || latestRunning(ticket)) && !store.effects().some(effect => ['running', 'uncertain'].includes(effect.state)), 'RECONCILIATION_REQUIRED', 'Stop and reconcile executions before changing Worker identity')
     const previous = JSON.parse(await readFile(join(state, 'worker-profile.json'), 'utf8'))
+    const params = capabilitiesOnly ? previous : input as { model: string; provider: z.infer<typeof providerSchema>; agents?: z.infer<typeof workerAgentsSchema> }
+    const capabilities = capabilitiesOnly ? await prepareCapabilities(state, input, [store.repository()!.executionRoot, store.repository()!.path]) : previous.capabilities
     await mkdir(join(state, 'backups'), { mode: 0o700, recursive: true })
     await writeFile(join(state, 'backups', `worker-profile-${Date.now()}-${randomBytes(6).toString('hex')}.json`), JSON.stringify(previous), { flag: 'wx', mode: 0o600 })
-    const profile = await createProfile(state, params.model, params.provider, params.agents ?? workerAgentsSchema.parse(previous.agents ?? { enabled: false }))
+    const profile = await createProfile(state, params.model, params.provider, params.agents ?? workerAgentsSchema.parse(previous.agents ?? { enabled: false }), capabilities)
+    store.audit(store.repository()!.id, 'runtime.capabilities_configured', { profileHash: profile.hash, skills: profile.capabilities?.skills.map(skill => ({ name: skill.name, sha256: skill.sha256 })), toolchain: profile.capabilities?.toolchain })
     for (const ticket of store.tickets()) if (ticket.binding) { ticket.restartThread = true; ticket.revision++; store.save(ticket); store.audit(ticket.id, 'runtime.profile_changed', { profileHash: profile.hash }) }
-    return { model: profile.model, provider: { id: profile.provider.id, authMode: profile.provider.authMode, endpointOrigin: profile.provider.baseUrl ? new URL(profile.provider.baseUrl).origin : undefined }, agents: profile.agents, profileHash: profile.hash, executionEnabled: false }
+    return { model: profile.model, provider: { id: profile.provider.id, authMode: profile.provider.authMode, endpointOrigin: profile.provider.baseUrl ? new URL(profile.provider.baseUrl).origin : undefined }, agents: profile.agents, capabilities: profile.capabilities, profileHash: profile.hash, executionEnabled: false }
   } finally { store.close(); await lock.release() }
 }
 function latestRunning(ticket: import('../../core/src/model.js').Ticket) { return ticket.assignments.at(-1)?.state === 'running' }

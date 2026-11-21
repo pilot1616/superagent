@@ -34,12 +34,12 @@ function fixture() {
     store.saveEffect({ ...store.effects().find(entry => entry.key === effect.key)!, state: 'done' })
   }
   const accept = (id: string) => engine.coordination.acceptResult(id, engine.require(id).revision, 'artifact', `Accepted contract ${id}`)
-  const plan = (keys = ['contract', 'backend', 'frontend', 'integration']) => {
+  const plan = (keys = ['contract', 'backend', 'frontend', 'integration'], maxAttempts = 3) => {
     const dependencies = keys.length === 1 ? [] : keys.length === 4 ? [
       { before: 'contract', after: 'backend', condition: 'artifact' }, { before: 'contract', after: 'frontend', condition: 'artifact' },
       { before: 'backend', after: 'integration', condition: 'artifact' }, { before: 'frontend', after: 'integration', condition: 'artifact' },
     ] : keys.slice(0, -1).map(key => ({ before: key, after: keys.at(-1)!, condition: 'artifact' }))
-    return engine.call('plan_create', { repositoryId: 'repo', title: 'Goal', tasks: keys.map(key => ({ key, title: key, request: `Implement ${key}` })), dependencies, integrationKey: keys.at(-1), expiresAt: new Date(Date.now() + 3600_000).toISOString(), maxAttempts: 3, requestId: randomUUID() }) as { plan: Plan; mapping: Record<string, string> }
+    return engine.call('plan_create', { repositoryId: 'repo', title: 'Goal', tasks: keys.map(key => ({ key, title: key, request: `Implement ${key}` })), dependencies, integrationKey: keys.at(-1), expiresAt: new Date(Date.now() + 3600_000).toISOString(), maxAttempts, requestId: randomUUID() }) as { plan: Plan; mapping: Record<string, string> }
   }
   const authorize = (id: string) => {
     engine.call('plan_start', { planId: id, expectedRevision: store.entity<Plan>('plan', id)!.revision, requestId: randomUUID() })
@@ -48,6 +48,163 @@ function fixture() {
   }
   return { store, engine, create, thread, subscribe, record, start, stop, ready, accept, plan, authorize }
 }
+
+function exhaustedFixture(keys = ['integration']) {
+  const context = fixture()
+  const created = context.plan(keys, 1)
+  context.authorize(created.plan.id)
+  const ticketId = created.mapping[keys[0]!]!
+  const fail = (question = false) => {
+    const effect = context.store.effects('pending').find(entry => entry.kind === 'launch' && entry.ticketId === ticketId)!
+    const ticket = context.engine.claim(effect)!
+    assert.ok(ticket)
+    if (question) context.engine.report(ticketId, latestAssignment(ticket)!.id, { state: 'blocked', summary: 'Missing reviewed input', checks: [], question: 'Please provide the reference' })
+    else context.engine.fail(ticketId, latestAssignment(ticket)!.id, 'Synthetic execution failure')
+    context.store.saveEffect({ ...context.store.effects().find(entry => entry.key === effect.key)!, state: 'done' })
+  }
+  fail()
+  const request = (operation: 'task_retry' | 'task_resume' = 'task_retry') => {
+    const params = { ticketId, expectedRevision: context.engine.require(ticketId).revision, requestId: randomUUID() }
+    context.engine.call(operation, params)
+    return { params, approval: context.store.approvals(ticketId).find(entry => entry.status === 'pending')! }
+  }
+  return { ...context, ...created, ticketId, fail, request }
+}
+
+test('exhausted plan retries request one human-approved assignment without changing the plan budget', () => {
+  const context = exhaustedFixture()
+  try {
+    const { engine, store, ticketId } = context
+    for (let generation = 2; generation <= 13; generation++) {
+      const { params, approval } = context.request()
+      assert.equal(approval.kind, 'retry')
+      assert.deepEqual(approval.details, { scope: engine.require(ticketId).scope, extraAttempt: true, planId: context.plan.id, planVersion: 1, planFingerprint: store.entity<Plan>('plan', context.plan.id)!.grant!.fingerprint, baseAttempts: 1, assigned: generation - 1, generation })
+      assert.equal(latestAssignment(engine.require(ticketId))!.generation, generation - 1)
+      assert.equal(store.effects('pending').length, 0)
+      assert.deepEqual(engine.call('task_retry', params), engine.view(engine.require(ticketId)))
+      assert.equal(store.approvals(ticketId).filter(entry => entry.status === 'pending').length, 1)
+      engine.approve(approval.id, true)
+      const assignment = latestAssignment(engine.require(ticketId))!
+      assert.equal(assignment.generation, generation)
+      assert.equal(assignment.retryApprovalId, approval.id)
+      assert.equal(store.approval(approval.id)!.assignmentId, assignment.id)
+      assert.equal(scheduling(store, engine.require(ticketId)).state, 'ready')
+      assert.equal(store.entity<Plan>('plan', context.plan.id)!.maxAttempts, 1)
+      assert.throws(() => engine.approve(approval.id, true), /not pending/)
+      context.fail()
+      assert.equal(store.effects('pending').length, 0)
+    }
+    const budget = engine.view(engine.require(ticketId)).retryBudget!
+    assert.equal(budget.assigned, 13)
+    assert.equal(budget.remaining, 0)
+    assert.equal(budget.requiresApproval, true)
+  } finally { context.store.close() }
+})
+
+test('declined, expired and stale retry extension approvals never create an assignment', () => {
+  for (const invalidation of ['decline', 'expiry', 'scope', 'plan', 'grant', 'held', 'planExpiry', 'reconciliation']) {
+    const context = exhaustedFixture()
+    try {
+      const { engine, store, ticketId } = context
+      const { approval } = context.request()
+      if (invalidation === 'decline') engine.approve(approval.id, false)
+      else {
+        if (invalidation === 'expiry') store.saveApproval({ ...approval, expiresAt: '2000-01-01T00:00:00.000Z' })
+        if (invalidation === 'scope') engine.call('task_message', { ticketId, expectedRevision: engine.require(ticketId).revision, text: 'New reviewed input', requestId: randomUUID() })
+        if (['plan', 'grant', 'held', 'planExpiry'].includes(invalidation)) {
+          const plan = store.entity<Plan>('plan', context.plan.id)!
+          if (invalidation === 'plan') plan.version++
+          if (invalidation === 'grant') plan.grant!.fingerprint = 'changed'
+          if (invalidation === 'held') plan.held = true
+          if (invalidation === 'planExpiry') plan.expiresAt = '2000-01-01T00:00:00.000Z'
+          store.saveEntity('plan', plan.id, plan)
+        }
+        if (invalidation === 'reconciliation') {
+          const ticket = engine.require(ticketId)
+          ticket.reconciliation = 'Unknown execution outcome'
+          store.save(ticket)
+        }
+        assert.throws(() => engine.approve(approval.id, true))
+        engine.expireApprovals()
+        if (invalidation !== 'reconciliation') assert.equal(store.approval(approval.id)!.status, 'expired')
+      }
+      assert.equal(latestAssignment(engine.require(ticketId))!.generation, 1)
+      assert.equal(store.effects('pending').length, 0)
+    } finally { context.store.close() }
+  }
+})
+
+test('extra retry approval cannot be replayed for a different assignment, generation, task or plan grant', () => {
+  for (const mutation of ['assignment', 'generation', 'task', 'plan', 'grant', 'approval']) {
+    const context = exhaustedFixture()
+    try {
+      const { engine, store, ticketId } = context
+      const { approval } = context.request()
+      engine.approve(approval.id, true)
+      const ticket = engine.require(ticketId)
+      if (mutation === 'assignment') latestAssignment(ticket)!.id = randomUUID()
+      if (mutation === 'generation') latestAssignment(ticket)!.generation++
+      if (mutation === 'task') ticket.id = randomUUID()
+      if (mutation === 'plan' || mutation === 'grant') {
+        const plan = store.entity<Plan>('plan', context.plan.id)!
+        if (mutation === 'plan') plan.version++
+        else plan.grant!.fingerprint = 'other-grant'
+        store.saveEntity('plan', plan.id, plan)
+      }
+      if (mutation === 'approval') store.saveApproval({ ...store.approval(approval.id)!, status: 'declined' })
+      assert.equal(scheduling(store, ticket).state, 'waiting_authorization')
+    } finally { context.store.close() }
+  }
+})
+
+test('human extensions preserve dependency, pause, hold and runtime gates', () => {
+  const context = exhaustedFixture(['first', 'integration'])
+  try {
+    const { engine, store, ticketId } = context
+    engine.approve(context.request().approval.id, true)
+    assert.equal(scheduling(store, engine.require(context.mapping.integration!)).state, 'waiting_dependencies')
+    store.set('paused', true)
+    assert.equal(scheduling(store, engine.require(ticketId)).state, 'paused')
+    store.set('paused', false)
+    const ticket = engine.require(ticketId)
+    ticket.mandate.humanHold = true
+    assert.equal(scheduling(store, ticket).state, 'held')
+    const guarded = new Engine(store, 'operator', () => 'Runtime enablement is required')
+    assert.equal(guarded.view(engine.require(ticketId)).scheduling.state, 'waiting_runtime')
+    assert.equal(guarded.claim(store.effects('pending').find(entry => entry.ticketId === ticketId)!), undefined)
+  } finally { context.store.close() }
+})
+
+test('resume beyond the base budget also requests a single bound extension', () => {
+  const context = exhaustedFixture()
+  try {
+    context.stop(context.ticketId)
+    const { approval } = context.request('task_resume')
+    assert.equal(approval.kind, 'resume')
+    assert.equal(approval.details.extraAttempt, true)
+    assert.equal(context.engine.require(context.ticketId).mandate.humanHold, true)
+    context.engine.approve(approval.id, true)
+    const ticket = context.engine.require(context.ticketId)
+    assert.equal(latestAssignment(ticket)!.generation, 2)
+    assert.equal(ticket.mandate.humanHold, false)
+    assert.equal(scheduling(context.store, ticket).state, 'ready')
+  } finally { context.store.close() }
+})
+
+test('blocked reports with questions can request retry without fabricating an answer', () => {
+  const context = exhaustedFixture()
+  try {
+    context.engine.approve(context.request().approval.id, true)
+    context.fail(true)
+    assert.equal(context.engine.view(context.engine.require(context.ticketId)).stage, 'answer')
+    const { approval } = context.request()
+    assert.equal(approval.details.generation, 3)
+    assert.equal(context.engine.view(context.engine.require(context.ticketId)).stage, 'approval')
+    context.engine.approve(approval.id, true)
+    assert.equal(latestAssignment(context.engine.require(context.ticketId))!.generation, 3)
+    assert.equal(context.engine.require(context.ticketId).report, undefined)
+  } finally { context.store.close() }
+})
 
 test('restored subscriptions fan out once, deduplicate shared threads, and correlation never routes', () => {
   const { store, engine, create, thread, subscribe, record } = fixture()

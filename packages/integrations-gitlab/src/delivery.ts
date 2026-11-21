@@ -3,6 +3,7 @@ import { latestAssignment, requireCondition, type Effect, type PublishPreview, t
 import type { Persistence } from '../../core/src/ports.js'
 import { validateMergeRequest, type GitLabPort } from './api.js'
 import { validInputs } from '../../core/src/scheduler.js'
+import { workspaceRepository } from '../../core/src/workspace.js'
 import { previewWorkspace, commitPreview } from './workspace.js'
 
 export class Delivery {
@@ -72,7 +73,7 @@ export class Delivery {
   }
   async observe(ticketId: string): Promise<void> {
     const ticket = this.engine.require(ticketId)
-    const repository = this.store.repository()!
+    const repository = workspaceRepository(this.store.repository()!, ticket)
     requireCondition(ticket.mergeRequest && repository.gitlab && ticket.branch, 'INVALID_STATE', 'Only bound merge requests can be observed')
     const record = await this.gitlab.read(repository.gitlab, ticket.mergeRequest.iid)
     const mergeRequest = validateMergeRequest(record, repository.gitlab, ticket.branch, repository.baseRef)

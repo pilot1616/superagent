@@ -44,12 +44,14 @@ test('EPERM with a still-present owned process group is never treated as success
 for (const leaderExitsFirst of [true, false]) {
   test(`process group cleanup reaps TERM-resistant descendants when leader exits ${leaderExitsFirst ? 'before' : 'during'} close`, { skip: process.platform === 'win32', timeout: 15_000 }, async () => {
     const childProgram = `process.on('SIGTERM',()=>{});console.log('ready');setInterval(()=>{},1000)`
-    const parentProgram = `const {spawn}=require('node:child_process');const descendant=spawn(process.execPath,['-e',${JSON.stringify(childProgram)}],{stdio:['ignore','pipe','ignore']});descendant.stdout.once('data',()=>{console.log(JSON.stringify({method:'ready',params:{pid:descendant.pid}}));${leaderExitsFirst ? 'process.exit(0)' : ''}});`
+    const parentProgram = `process.stdin.once('data',line=>{const request=JSON.parse(String(line).trim());console.log(JSON.stringify({id:request.id,result:{}}));const {spawn}=require('node:child_process');const descendant=spawn(process.execPath,['-e',${JSON.stringify(childProgram)}],{stdio:['ignore','pipe','ignore']});descendant.stdout.once('data',()=>{console.log(JSON.stringify({method:'ready',params:{pid:descendant.pid}}));${leaderExitsFirst ? 'process.exit(0)' : ''}});});`
     const server = new AppServer(process.execPath, ['-e', parentProgram], { cwd: process.cwd(), env: {} })
     const leaderExit = once(server.child, 'exit')
     let descendantPid: number | undefined
     try {
-      const [message] = await once(server, 'notification')
+      const ready = once(server, 'notification')
+      await server.initialize()
+      const [message] = await ready
       descendantPid = message.params.pid
       if (leaderExitsFirst) await leaderExit
       const closing = server.close()
@@ -72,7 +74,7 @@ test('T14: an observed descendant outside the process group keeps cleanup uncert
   try {
     const [notification] = await once(server, 'notification')
     descendantPid = notification.params.pid
-    server.tracker!.sample()
+    await server.tracker!.sample()
     assert.ok(server.tracker!.observed.has(descendantPid!))
     await assert.rejects(server.close(), /descendant escaped or survived/)
     assert.doesNotThrow(() => process.kill(descendantPid!, 0))

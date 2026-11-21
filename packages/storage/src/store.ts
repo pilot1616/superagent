@@ -48,31 +48,49 @@ export class Store {
   set(key: string, value: unknown): void { this.db.prepare('INSERT INTO metadata VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, JSON.stringify(value)) }
   entity<Result>(kind: string, id: string): Result | undefined { return parse(this.db.prepare('SELECT value FROM entity WHERE kind=? AND id=?').get(kind, id)) }
   entities<Result>(kind: string): Result[] { return this.db.prepare('SELECT value FROM entity WHERE kind=? ORDER BY rowid').all(kind).map(row => parse<Result>(row)!) }
-  saveEntity(kind: string, id: string, value: unknown): void { this.db.prepare('INSERT INTO entity VALUES (?,?,?) ON CONFLICT(kind,id) DO UPDATE SET value=excluded.value').run(kind, id, JSON.stringify(value)) }
+  saveEntity(kind: string, id: string, value: unknown): void {
+    if (kind === 'plan' && this.entity('deleted_plan', id)) throw new DomainError('NOT_FOUND', 'Plan was deleted', 404)
+    this.db.prepare('INSERT INTO entity VALUES (?,?,?) ON CONFLICT(kind,id) DO UPDATE SET value=excluded.value').run(kind, id, JSON.stringify(value))
+  }
+  removeEntity(kind: string, id: string): void { this.db.prepare('DELETE FROM entity WHERE kind=? AND id=?').run(kind, id) }
   repository(): Repository | undefined { return this.get('repository') }
   ticket(id: string): Ticket | undefined { return parse(this.db.prepare('SELECT value FROM ticket WHERE id=?').get(id)) }
   tickets(): Ticket[] { return this.db.prepare('SELECT value FROM ticket ORDER BY rowid DESC').all().map(row => parse<Ticket>(row)!) }
-  save(ticket: Ticket): void { this.db.prepare('INSERT INTO ticket VALUES (?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value').run(ticket.id, JSON.stringify(ticket)) }
+  save(ticket: Ticket): void {
+    if (this.entity('deleted_task', ticket.id)) throw new DomainError('NOT_FOUND', 'Task was deleted', 404)
+    this.db.prepare('INSERT INTO ticket VALUES (?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value').run(ticket.id, JSON.stringify(ticket))
+  }
+  removeTicket(id: string): void { this.db.prepare('DELETE FROM ticket WHERE id=?').run(id) }
   approvals(ticketId?: string): Approval[] {
     const rows = ticketId ? this.db.prepare('SELECT value FROM approval WHERE ticket_id=? ORDER BY rowid').all(ticketId) : this.db.prepare('SELECT value FROM approval ORDER BY rowid').all()
     return rows.map(row => parse<Approval>(row)!)
   }
   approval(id: string): Approval | undefined { return parse(this.db.prepare('SELECT value FROM approval WHERE id=?').get(id)) }
-  saveApproval(approval: Approval): void { this.db.prepare('INSERT INTO approval VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value').run(approval.id, approval.ticketId, JSON.stringify(approval)) }
-  saveEffect(effect: Effect): void { this.db.prepare('INSERT INTO effect VALUES (?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET state=excluded.state,due=excluded.due,value=excluded.value').run(effect.key, effect.ticketId, effect.state, effect.dueAt, JSON.stringify(effect)) }
+  saveApproval(approval: Approval): void {
+    if (approval.status === 'pending' && (this.entity('deleted_task', approval.ticketId) || this.entity('deleted_plan', approval.ticketId))) throw new DomainError('NOT_FOUND', 'Approval target was deleted', 404)
+    this.db.prepare('INSERT INTO approval VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value').run(approval.id, approval.ticketId, JSON.stringify(approval))
+  }
+  saveEffect(effect: Effect): void {
+    if (effect.state !== 'done' && this.entity('deleted_task', effect.ticketId)) throw new DomainError('NOT_FOUND', 'Task was deleted', 404)
+    this.db.prepare('INSERT INTO effect VALUES (?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET state=excluded.state,due=excluded.due,value=excluded.value').run(effect.key, effect.ticketId, effect.state, effect.dueAt, JSON.stringify(effect))
+  }
   effects(state?: Effect['state']): Effect[] {
     const rows = state ? this.db.prepare('SELECT value FROM effect WHERE state=? ORDER BY due,rowid').all(state) : this.db.prepare('SELECT value FROM effect ORDER BY due,rowid').all()
     return rows.map(row => parse<Effect>(row)!)
+  }
+  receipt<Result>(operator: string, operation: string, requestId: string, input: unknown): { result: Result } | undefined {
+    const key = JSON.stringify([operator, operation, requestId])
+    const prior = this.db.prepare('SELECT hash,value FROM idempotency WHERE key=?').get(key) as { hash: string; value: string } | undefined
+    if (!prior) return undefined
+    if (prior.hash !== digest(input)) throw new DomainError('IDEMPOTENCY_CONFLICT', 'The request ID was already used with different content', 409)
+    return { result: JSON.parse(prior.value) as Result }
   }
   once<Result>(operator: string, operation: string, requestId: string, input: unknown, action: () => Result): Result {
     return this.atomic(() => {
       const key = JSON.stringify([operator, operation, requestId])
       const hash = digest(input)
-      const prior = this.db.prepare('SELECT hash,value FROM idempotency WHERE key=?').get(key) as { hash: string; value: string } | undefined
-      if (prior) {
-        if (prior.hash !== hash) throw new DomainError('IDEMPOTENCY_CONFLICT', 'The request ID was already used with different content', 409)
-        return JSON.parse(prior.value) as Result
-      }
+      const prior = this.receipt<Result>(operator, operation, requestId, input)
+      if (prior) return prior.result
       const result = action()
       this.db.prepare('INSERT INTO idempotency VALUES (?,?,?)').run(key, hash, JSON.stringify(result))
       return result

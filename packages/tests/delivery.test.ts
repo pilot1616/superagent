@@ -47,6 +47,40 @@ async function fixture(project: GitLabProject = { url: 'https://gitlab.com', pro
   const delivery = new Delivery(store, engine, root, api, async (_ticket, _preview, sha) => { pushed = sha })
   return { root, repository, store, engine, ticket, api, delivery, counts: () => ({ pushed, createdCount }), cleanup: async () => { store.close(); await rm(root, { recursive: true, force: true }) } }
 }
+for (const hasUncommittedChanges of [false, true]) test(`publication preserves Worker local commits${hasUncommittedChanges ? ' and commits subsequent reviewed edits' : ' without creating a duplicate commit'}`, async () => {
+  const context = await fixture()
+  const { engine, store, ticket, delivery, repository } = context
+  try {
+    await git(ticket.workspace!, ['add', '--', 'README', 'new.txt'])
+    await git(ticket.workspace!, ['-c', 'user.name=Worker Fixture', '-c', 'user.email=worker@example.invalid', 'commit', '-m', 'Worker local result'])
+    const localHead = await git(ticket.workspace!, ['rev-parse', 'HEAD'])
+    if (hasUncommittedChanges) await writeFile(join(ticket.workspace!, 'new.txt'), 'follow-up local edit\n')
+    const current = engine.require(ticket.id)
+    assert.equal((await prepareWorkspace(repository, current)).workspace, ticket.workspace)
+    engine.call('task_publish', { ticketId: ticket.id, expectedRevision: current.revision, headSha: localHead, requestId: randomUUID() })
+    const approval = store.approvals(ticket.id).find(entry => entry.kind === 'publish')!
+    const preview = await delivery.preview(approval.id, 'Test Author', 'test@example.invalid')
+    assert.equal(preview.headSha, localHead)
+    assert.match(preview.diff, /README/)
+    assert.match(preview.diff, /new.txt/)
+    await delivery.approve(approval.id, preview.fingerprint)
+    const effect = store.effects('pending').find(entry => entry.kind === 'publish')!
+    engine.claim(effect)
+    await delivery.publish(effect)
+    const published = context.counts().pushed
+    assert.equal(context.counts().createdCount, 1)
+    assert.equal(engine.require(ticket.id).mergeRequest?.headSha, published)
+    assert.equal(await git(ticket.workspace!, ['rev-parse', 'HEAD']), published)
+    if (hasUncommittedChanges) {
+      assert.notEqual(published, localHead)
+      assert.equal(await git(ticket.workspace!, ['rev-parse', 'HEAD^']), localHead)
+      assert.equal(await git(ticket.workspace!, ['show', 'HEAD:new.txt']), 'follow-up local edit')
+    } else assert.equal(published, localHead)
+    assert.equal(await git(repository.path, ['rev-parse', 'main']), ticket.baseSha)
+    assert.equal(await git(ticket.workspace!, ['status', '--porcelain']), '')
+  } finally { await context.cleanup() }
+})
+
 test('publication preview covers untracked files, rejects mutation, publishes once, observes only bound MRs', async () => {
   const context = await fixture()
   const { engine, store, ticket, delivery, repository, root } = context

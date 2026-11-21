@@ -13,7 +13,7 @@ import type { ProcessIdentity } from './processes.js'
 export const verificationSuiteVersion = 'restricted-local-v1'
 export const verificationScenarios = [
   { key: 'V1', title: '协议与独立环境', capabilities: ['protocol_handshake', 'effective_profile'] },
-  { key: 'V2', title: '所有工具的文件、凭据、Git 与网络负向边界', capabilities: ['tool_filesystem_boundary', 'tool_network_boundary', 'protected_control_data'] },
+  { key: 'V2', title: '可信本地 Git 写入与文件、凭据、网络边界', capabilities: ['tool_filesystem_boundary', 'tool_network_boundary', 'protected_control_data'] },
   { key: 'V3', title: '真实模型修改、离线检查与结构化报告', capabilities: ['authenticated_model_turn', 'local_edit_and_check'] },
   { key: 'V4', title: '真实权限拒绝及人工澄清', capabilities: ['approval_decline_round_trip', 'user_input_round_trip'] },
   { key: 'V5', title: '真实中断与进程清理', capabilities: ['cancellation_supported_scope'] },

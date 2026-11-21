@@ -2,15 +2,17 @@ export type Stage = 'draft' | 'queued' | 'working' | 'approval' | 'answer' | 'wa
 export interface GitLabProject { url: string; projectPath: string }
 export interface Repository { id: string; path: string; remote: string; baseRef: string; baseSha: string; executionRoot: string; gitlab?: GitLabProject }
 export interface Input { id: string; text: string; source: 'manual' | 'gitlab'; sequence: number; state: 'pending' | 'sending' | 'accepted' | 'settled'; createdAt: string; eventId?: string; contextOnly?: boolean; returned?: boolean; superseded?: boolean }
-export interface Assignment { id: string; generation: number; state: 'pending' | 'running' | 'ended'; startedAt?: string; endedAt?: string; inputs?: AcceptedResult[]; planVersion?: number; baseSha?: string; resources?: string[]; runtimeFingerprint?: string; runtimeFence?: number; enablementId?: string; launchPhase?: 'claimed' | 'preparing' | 'process_started' | 'turn_sending' | 'turn_acknowledged' | 'cleanup' | 'ended' }
+export interface Assignment { id: string; generation: number; state: 'pending' | 'running' | 'ended'; startedAt?: string; endedAt?: string; inputs?: AcceptedResult[]; planVersion?: number; retryApprovalId?: string; baseSha?: string; resources?: string[]; runtimeFingerprint?: string; runtimeFence?: number; enablementId?: string; launchPhase?: 'claimed' | 'preparing' | 'process_started' | 'turn_sending' | 'turn_acknowledged' | 'cleanup' | 'ended' }
 export interface Report { state: 'waiting' | 'ready' | 'blocked' | 'failed' | 'dropped'; summary: string; checks: string[]; question?: string | null }
 export interface Checkpoint { id: string; ticketId: string; assignmentId: string; kind: 'progress' | 'report' | 'system'; scope: string; summary: string; checks: string[]; state?: Report['state']; question?: string | null; createdAt: string }
 export interface WorkerAgent { id: string; ticketId: string; assignmentId: string; threadId: string; parentThreadId: string; turnId?: string; role?: string; nickname?: string; scope?: string; status: 'pendingInit' | 'running' | 'interrupted' | 'completed' | 'errored' | 'shutdown' | 'notFound' | 'uncertain'; progress?: string; summary?: string; cleanup?: 'closed' | 'uncertain'; createdAt: string; updatedAt: string }
 export interface Binding { threadId: string; turnId?: string; version: string; profileHash: string }
 export interface MergeRequest { iid: number; url: string; headSha: string; branch: string; state: 'open' | 'merged' | 'closed'; mergedSha?: string }
-export interface AcceptedResult { id: string; ticketId: string; kind: 'artifact' | 'code'; content: string; hash: string; sha?: string; acceptedAt: string; operatorId: string }
+export interface AcceptedResult { id: string; ticketId: string; kind: 'artifact' | 'code'; content: string; hash: string; sha?: string; acceptedAt: string; operatorId: string; acceptedBy?: 'human' | 'coordinator' }
 export interface Dependency { before: string; after: string; condition: 'artifact' | 'code' }
-export interface Plan { id: string; title: string; revision: number; version: number; ticketIds: string[]; dependencies: Dependency[]; integrationId: string; paused: boolean; held: boolean; heldTicketIds: string[]; maxAttempts: number; expiresAt: string; grant?: { version: number; fingerprint: string }; completed?: boolean }
+export interface PlanWorkflow { automaticHandoffs: boolean; materialPaths: string[] }
+export interface PlanWorkspace { id: string; repositoryId: string; baseRef: string; baseSha: string; targetBranch: string; branchPrefix: string; resolvedAt: string }
+export interface Plan { id: string; title: string; revision: number; version: number; ticketIds: string[]; dependencies: Dependency[]; integrationId: string; paused: boolean; held: boolean; heldTicketIds: string[]; maxAttempts: number; expiresAt: string; grant?: { version: number; fingerprint: string }; completed?: boolean; workflow?: PlanWorkflow; workspace?: PlanWorkspace }
 export interface Thread { id: string; title: string; revision: number; correlated: string[]; subscriptions: { ticketId: string; mode: 'owning' | 'context'; origin?: boolean }[] }
 export interface TaskEvent { id: string; threadIds: string[]; text: string; source: 'manual' | 'gitlab'; createdAt: string; delivered: string[]; owners: string[]; returned: string[]; decision?: { kind: 'accept' | 'attach' | 'ignore' | 'stop'; reason: string; ticketId?: string } }
 export interface Ticket {
@@ -19,7 +21,8 @@ export interface Ticket {
   mandate: { operatorId: string; scope: string; humanHold: boolean; executionGranted: boolean }
   inputs: Input[]; assignments: Assignment[]; report?: Report; binding?: Binding; restartThread?: boolean
   workspace?: string; branch?: string; baseSha?: string; mergeRequest?: MergeRequest
-  planId?: string; priority?: number; resources?: string[]; result?: AcceptedResult
+  workspaceBinding?: PlanWorkspace
+  planId?: string; priority?: number; resources?: string[]; result?: AcceptedResult; reviewRequired?: boolean
   ended?: 'completed' | 'stopped'; stopping?: boolean; reconciliation?: string; failure?: string
 }
 export interface Approval {

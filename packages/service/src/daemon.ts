@@ -5,7 +5,8 @@ import { join } from 'node:path'
 import { backup } from 'node:sqlite'
 import { z } from 'zod'
 import { Engine, tools } from '../../core/src/engine.js'
-import { DomainError, latestAssignment, requireCondition, type Effect } from '../../core/src/model.js'
+import { deleteRecords } from '../../core/src/deletion.js'
+import { DomainError, latestAssignment, requireCondition, type Effect, type Plan } from '../../core/src/model.js'
 import type { Executor } from '../../core/src/ports.js'
 import { Store } from '../../storage/src/store.js'
 import { CodexExecutor } from '../../executor-codex/src/executor.js'
@@ -21,6 +22,9 @@ import { pushCommit } from '../../integrations-gitlab/src/workspace.js'
 import { validateGitLabProject } from '../../core/src/gitlab.js'
 import { candidates } from '../../core/src/scheduler.js'
 import { verifyAcceptedCode } from './workspace.js'
+import { TaskMaterials } from './materials.js'
+import { WorkflowController } from './workflow.js'
+import { PlanWorkspaces } from './plan-workspaces.js'
 
 const rpcSchema = z.object({ method: z.string().max(100), params: z.unknown() }).strict()
 const equal = (actual: string, expected: string) => Buffer.byteLength(actual) === Buffer.byteLength(expected) && timingSafeEqual(Buffer.from(actual), Buffer.from(expected))
@@ -55,6 +59,10 @@ export async function startService(state: string, factory?: (store: Store, engin
   const verification = new RuntimeVerificationService(runtime)
   const engine = new Engine(store, config.operatorId, undefined, factory ? undefined : runtime)
   const executor = factory?.(store, engine) ?? new CodexExecutor(store, engine, state)
+  const materials = new TaskMaterials(state, store, engine, () => executor.active)
+  const jobTickets = new Set<string>()
+  const workspaces = new PlanWorkspaces(store, engine, () => new Set(executor.active.keys()), () => jobTickets)
+  const workflow = new WorkflowController(store, engine, materials, factory ? undefined : runtime, workspaces)
   const gitlab = new GitLabHttp(state, store.repository()?.gitlab)
   const delivery = new Delivery(store, engine, state, gitlab, async (ticket, preview, sha) => pushCommit(ticket, preview, sha, await gitlab.token()))
   engine.recover()
@@ -70,7 +78,6 @@ export async function startService(state: string, factory?: (store: Store, engin
       if (!ticket.mandate.humanHold) engine.call('task_stop', { ticketId: id, expectedRevision: ticket.revision, requestId: randomUUID(), reason: `Runtime safety stop: ${reasonCode}` })
     }
   }
-  const jobTickets = new Set<string>()
   let observedAt = 0
   let observing = false
   const poll = async () => {
@@ -91,6 +98,16 @@ export async function startService(state: string, factory?: (store: Store, engin
   }
   const finish = (effect: Effect, status: Effect['state']) => store.saveEffect({ ...(store.effects().find(entry => entry.key === effect.key) ?? effect), state: status })
   const dispatch = async (effect: Effect) => {
+    if (effect.kind === 'launch') {
+      const pending = store.ticket(effect.ticketId)
+      if (!pending) return
+      if (!factory || pending.workspaceBinding) {
+        try {
+          const prepared = await workspaces.prepare({ ticketId: pending.id, expectedRevision: pending.revision }, true) as { ready: boolean }
+          if (!prepared.ready || closing) return
+        } catch { return }
+      }
+    }
     const ticket = engine.claim(effect)
     if (!ticket) return
     try {
@@ -119,6 +136,7 @@ export async function startService(state: string, factory?: (store: Store, engin
     if (closing) return
     if (!lock.owned()) { void close(); return }
     engine.expireApprovals()
+    engine.coordination.advanceHandoffs()
     store.atomic(() => {
       for (const ticket of store.tickets()) {
         const decision = engine.decision(ticket, new Set(executor.active.keys()))
@@ -141,6 +159,13 @@ export async function startService(state: string, factory?: (store: Store, engin
     }
   }
   const callAdmin = async (method: string, raw: unknown): Promise<unknown> => {
+    if (method === 'plan-workspace-configure') return workspaces.configure(raw)
+    if (method === 'plan-workspace-review') return workspaces.review(raw)
+    if (method === 'delete-task' || method === 'delete-plan') return deleteRecords(engine, method, raw, new Set(executor.active.keys()), jobTickets)
+    if (method === 'human-control') return workflow.control(raw)
+    if (method === 'task-materials-list') return materials.list(raw)
+    if (method === 'task-materials-preview') return materials.preview(raw)
+    if (method === 'task-materials-attach') return materials.attach(raw)
     if (method === 'runtime-status') { z.object({}).strict().parse(raw); return runtime.status() }
     if (method === 'runtime-verify-preview') return verification.preview(raw)
     if (method === 'runtime-verify') return verification.start(raw)
@@ -160,7 +185,7 @@ export async function startService(state: string, factory?: (store: Store, engin
       }
       return result
     }
-    if (method === 'runtime-clear-reviews') { z.object({}).strict().parse(raw); runtime.clearReviews(); return { cleared: true } }
+    if (method === 'runtime-clear-reviews') { z.object({}).strict().parse(raw); runtime.clearReviews(); materials.clear(); return { cleared: true } }
     if (method === 'runtime-answer') {
       const params = z.object({ id: z.string().uuid(), requestId: z.string().min(8).max(150), expectedRevision: z.number().int().positive(), repositoryId: z.string().min(1).max(1024), confirmation: z.string().uuid(), answers: answersSchema }).strict().parse(raw)
       const approval = store.approval(params.id)
@@ -189,7 +214,7 @@ export async function startService(state: string, factory?: (store: Store, engin
         await delivery.approve(params.id, params.expectedFingerprint)
         return store.approval(params.id)
       }
-      return engine.approve(params.id, params.accept, params.expectedFingerprint)
+      return workflow.decide(params.id, params.accept, params.expectedFingerprint)
     }
     if (method === 'publish-preview') {
       const params = z.object({ id: z.string(), authorName: z.string(), authorEmail: z.string() }).strict().parse(raw)
@@ -209,7 +234,14 @@ export async function startService(state: string, factory?: (store: Store, engin
       const params = z.object({ ticketId: z.string(), expectedRevision: z.number().int().positive(), kind: z.enum(['artifact', 'code']), content: z.string().trim().min(1).max(30_000) }).strict().parse(raw)
       const ticket = engine.require(params.ticketId)
       const sha = params.kind === 'code' ? await verifyAcceptedCode(store.repository()!, ticket) : undefined
-      return engine.coordination.acceptResult(params.ticketId, params.expectedRevision, params.kind, params.content, sha)
+      return store.atomic(() => {
+        const result = engine.coordination.acceptResult(params.ticketId, params.expectedRevision, params.kind, params.content, sha)
+        if (ticket.planId) {
+          const plan = engine.coordination.require<Plan>('plan', ticket.planId)
+          if (plan.workflow && engine.coordination.canComplete(plan)) engine.coordination.complete(plan.id, plan.revision)
+        }
+        return result
+      })
     }
     if (method === 'complete-plan') {
       const params = z.object({ planId: z.string(), expectedRevision: z.number().int().positive() }).strict().parse(raw)
@@ -246,7 +278,13 @@ export async function startService(state: string, factory?: (store: Store, engin
       requireCondition(isAdmin || equal(authorization, bridge), 'UNAUTHENTICATED', 'Invalid local credential')
       const payload = rpcSchema.parse(await body(request))
       let data: unknown
-      if (Object.hasOwn(tools, payload.method)) {
+      if (payload.method === 'plan_workspace_preview') data = await workspaces.preview(payload.params)
+      else if (payload.method === 'task_workspace_prepare') data = await workspaces.prepare(payload.params)
+      else if (Object.hasOwn(tools, payload.method)) {
+        if (payload.method === 'plan_create') {
+          const params = tools.plan_create.parse(payload.params)
+          if (params.workspace && !store.receipt(engine.operatorId, 'plan_create', params.requestId, params)) await workspaces.validateInput(params.workspace)
+        }
         data = engine.call(payload.method as keyof typeof tools, payload.params)
         if (payload.method === 'health') {
           const status = runtime.status()

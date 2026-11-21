@@ -3,6 +3,7 @@ import { z } from 'zod'
 import type { Engine } from './engine.js'
 import { DomainError, latestAssignment, requireCondition, type AcceptedResult, type Approval, type Dependency, type Plan, type TaskEvent, type Thread, type Ticket } from './model.js'
 import { validInputs } from './scheduler.js'
+import { workspaceInput, workspaceBinding } from './workspace.js'
 
 const identifier = z.string().min(1).max(150)
 const requestId = z.string().min(8).max(150)
@@ -12,6 +13,7 @@ const pagination = { cursor: z.number().int().nonnegative().default(0), limit: z
 const edge = z.object({ before: identifier, after: identifier, condition: z.enum(['artifact', 'code']) }).strict()
 const constraints = { priority: z.number().int().min(0).max(10).default(0), resources: z.array(z.string().regex(/^[\w:./-]{1,100}$/)).max(20).default([]) }
 const versionedPlan = { planId: identifier, expectedRevision: revision, requestId }
+const workflow = z.object({ automaticHandoffs: z.boolean().default(true), materialPaths: z.array(z.string().min(1).max(4096).startsWith('/')).max(10).default([]) }).strict()
 export const coordinationTools = {
   thread_create: z.object({ title: z.string().trim().min(1).max(160), requestId }).strict(),
   thread_get: z.object({ threadId: identifier, ...pagination }).strict(),
@@ -22,7 +24,7 @@ export const coordinationTools = {
   route_context: z.object({ eventId: identifier }).strict(),
   task_route: z.object({ items: z.array(z.object({ eventId: identifier, kind: z.enum(['accept', 'attach', 'ignore', 'stop']), ticketId: identifier.optional(), expectedRevision: revision.optional(), title: z.string().trim().min(1).max(160).optional(), reason: z.string().trim().min(1).max(1000) }).strict()).min(1).max(30), requestId }).strict(),
   task_handback: z.object({ ticketId: identifier, expectedRevision: revision, eventId: identifier, reason: text, requestId }).strict(),
-  plan_create: z.object({ repositoryId: identifier, title: z.string().trim().min(1).max(160), tasks: z.array(z.object({ key: identifier, title: z.string().trim().min(1).max(160), request: text, ...constraints }).strict()).min(1).max(100), dependencies: z.array(edge).max(500), integrationKey: identifier, maxAttempts: z.number().int().min(1).max(10).default(3), expiresAt: z.iso.datetime(), requestId }).strict(),
+  plan_create: z.object({ repositoryId: identifier, title: z.string().trim().min(1).max(160), tasks: z.array(z.object({ key: identifier, title: z.string().trim().min(1).max(160), request: text, reviewRequired: z.boolean().default(false), ...constraints }).strict()).min(1).max(100), dependencies: z.array(edge).max(500), integrationKey: identifier, maxAttempts: z.number().int().min(1).max(10).default(3), expiresAt: z.iso.datetime(), workflow: workflow.default({ automaticHandoffs: true, materialPaths: [] }), workspace: workspaceInput.optional(), requestId }).strict(),
   plan_get: z.object({ planId: identifier }).strict(),
   plan_list: z.object(pagination).strict(),
   plan_update: z.object({ ...versionedPlan, dependencies: z.array(edge).max(500), tasks: z.array(z.object({ ticketId: identifier, ...constraints }).strict()).max(100), maxAttempts: z.number().int().min(1).max(10), expiresAt: z.iso.datetime() }).strict(),
@@ -30,7 +32,7 @@ export const coordinationTools = {
   plan_pause: z.object({ ...versionedPlan, paused: z.boolean() }).strict(),
   plan_stop: z.object({ ...versionedPlan, reason: text }).strict(),
 }
-export const readOperations = ['task_get', 'task_list', 'health', 'thread_get', 'thread_list', 'route_context', 'plan_get', 'plan_list']
+export const readOperations = ['task_get', 'task_list', 'health', 'thread_get', 'thread_list', 'route_context', 'plan_get', 'plan_list', 'plan_workspace_preview']
 const fingerprint = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex')
 const now = () => new Date().toISOString()
 
@@ -80,7 +82,9 @@ export class Coordination {
   }
   private spec(plan: Plan) {
     return { planId: plan.id, version: plan.version, title: plan.title, dependencies: plan.dependencies, integrationId: plan.integrationId, maxAttempts: plan.maxAttempts, expiresAt: plan.expiresAt,
-      tasks: plan.ticketIds.map(id => { const ticket = this.engine.require(id); return { id, scope: ticket.scope, title: ticket.title, resources: ticket.resources, priority: ticket.priority } }) }
+      ...(plan.workflow ? { workflow: plan.workflow } : {}),
+      ...(plan.workspace ? { workspace: plan.workspace } : {}),
+      tasks: plan.ticketIds.map(id => { const ticket = this.engine.require(id); return { id, scope: ticket.scope, title: ticket.title, resources: ticket.resources, priority: ticket.priority, ...(plan.workflow ? { reviewRequired: ticket.reviewRequired ?? false } : {}) } }) }
   }
   private subscribe(thread: Thread, ticketId: string, mode: 'owning' | 'context', origin = false): void {
     const prior = thread.subscriptions.find(entry => entry.ticketId === ticketId)
@@ -204,10 +208,16 @@ export class Coordination {
         const planId = randomUUID(), mapping = new Map<string, string>()
         for (const task of params.tasks) {
           const { ticket } = this.engine.call('task_create', { repositoryId: params.repositoryId, title: task.title, request: task.request, requestId: randomUUID() }) as { ticket: Ticket }
-          ticket.planId = planId; ticket.priority = task.priority; ticket.resources = [...new Set<string>(task.resources)]
+          ticket.planId = planId; ticket.priority = task.priority; ticket.resources = [...new Set<string>(task.resources)]; ticket.reviewRequired = task.reviewRequired
           this.store.save(ticket); mapping.set(task.key, ticket.id)
         }
         const plan: Plan = { id: planId, title: params.title, revision: 1, version: 1, ticketIds: [...mapping.values()], dependencies: params.dependencies.map((dependency: Dependency) => ({ ...dependency, before: mapping.get(dependency.before)!, after: mapping.get(dependency.after)! })), integrationId: mapping.get(params.integrationKey)!, paused: false, held: false, heldTicketIds: [], maxAttempts: params.maxAttempts, expiresAt: params.expiresAt }
+        plan.workflow = params.workflow
+        if (params.workspace) {
+          requireCondition(params.workspace.repositoryId === params.repositoryId, 'WORKSPACE_REPOSITORY_MISMATCH', 'Workspace must use the registered plan repository')
+          plan.workspace = workspaceBinding(params.workspace, randomUUID())
+          for (const id of plan.ticketIds) { const ticket = this.engine.require(id); ticket.workspaceBinding = plan.workspace; this.store.save(ticket) }
+        }
         this.store.saveEntity('plan', plan.id, plan); this.store.audit(plan.id, 'plan.created', { mapping: Object.fromEntries(mapping) })
         return { ...this.planView(plan), mapping: Object.fromEntries(mapping) }
       }
@@ -291,7 +301,8 @@ export class Coordination {
         if (plan.heldTicketIds.includes(id)) { ticket.mandate.humanHold = false; if (ticket.ended === 'stopped') delete ticket.ended }
         if (!ticket.ended && !ticket.mandate.humanHold) {
           ticket.mandate.executionGranted = true
-          if (!ticket.report && !ticket.failure) this.engine.queue(ticket)
+          const migratedBudgetExhausted = ticket.workspaceBinding && ticket.restartThread && latestAssignment(ticket)?.state === 'ended' && latestAssignment(ticket)!.generation >= plan.maxAttempts
+          if (!ticket.report && !ticket.failure && !migratedBudgetExhausted) this.engine.queue(ticket)
           this.engine.save(ticket, 'plan.execution_granted', { planId: plan.id, version: plan.version })
         }
       }
@@ -306,7 +317,7 @@ export class Coordination {
     const plan = this.require<Plan>('plan', ticket.planId)
     if (plan.heldTicketIds.includes(ticket.id)) { plan.heldTicketIds = plan.heldTicketIds.filter(id => id !== ticket.id); this.save('plan', plan, 'plan.individual_hold') }
   }
-  acceptResult(ticketId: string, expectedRevision: number, kind: 'artifact' | 'code', content: string, sha?: string): AcceptedResult {
+  acceptResult(ticketId: string, expectedRevision: number, kind: 'artifact' | 'code', content: string, sha?: string, acceptedBy: 'human' | 'coordinator' = 'human'): AcceptedResult {
     return this.store.atomic(() => {
       const ticket = this.engine.require(ticketId)
       this.check(ticket.revision, expectedRevision)
@@ -318,20 +329,46 @@ export class Coordination {
         requireCondition(!plan.held, 'INVALID_STATE', 'Plan is held')
         requireCondition(plan.dependencies.filter(dependency => dependency.before === ticketId).every(dependency => dependency.condition === kind), 'INVALID_STATE', 'Result kind must satisfy the declared outgoing dependencies')
       }
-      const result: AcceptedResult = { id: randomUUID(), ticketId, kind, content, hash: fingerprint({ kind, content, sha }), ...(sha ? { sha } : {}), acceptedAt: now(), operatorId: this.engine.operatorId }
+      const result: AcceptedResult = { id: randomUUID(), ticketId, kind, content, hash: fingerprint({ kind, content, sha }), ...(sha ? { sha } : {}), acceptedAt: now(), operatorId: acceptedBy === 'coordinator' ? 'coordinator' : this.engine.operatorId, acceptedBy }
       ticket.result = result; ticket.ended = 'completed'
       this.engine.save(ticket, 'result.accepted', result)
       return result
     })
   }
+  advanceHandoffs(): number {
+    return this.store.atomic(() => {
+      if (this.store.get('paused')) return 0
+      let accepted = 0
+      for (const plan of this.store.entities<Plan>('plan')) {
+        if (!plan.workflow?.automaticHandoffs || plan.held || plan.paused || plan.completed || plan.grant?.version !== plan.version || Date.parse(plan.expiresAt) <= Date.now() || plan.grant.fingerprint !== fingerprint(this.spec(plan))) continue
+        if (this.store.approvals(plan.id).some(approval => approval.status === 'pending')) continue
+        for (const id of plan.ticketIds) {
+          const ticket = this.engine.require(id)
+          if (id === plan.integrationId || ticket.reviewRequired || ticket.result || ticket.ended || ticket.failure || ticket.mergeRequest || !ticket.mandate.executionGranted || ticket.mandate.humanHold || ticket.stopping || ticket.reconciliation || ticket.report?.state !== 'ready' || ticket.report.question || !ticket.report.checks.some(check => check.trim()) || latestAssignment(ticket)?.state !== 'ended' || !validInputs(this.store, ticket)) continue
+          const outgoing = plan.dependencies.filter(edge => edge.before === id)
+          if (plan.dependencies.filter(edge => edge.after === id).some(edge => { const upstream = this.engine.require(edge.before); return upstream.mandate.humanHold || upstream.reconciliation || upstream.stopping })) continue
+          if (!outgoing.length || outgoing.some(edge => edge.condition !== 'artifact') || ticket.inputs.some(entry => entry.state !== 'settled') || this.store.effects().some(effect => effect.ticketId === id && effect.state !== 'done') || this.store.approvals(id).some(approval => approval.status === 'pending')) continue
+          const content = JSON.stringify({ summary: ticket.report.summary, checks: ticket.report.checks, notice: 'Automatic artifact handoff, not independent human verification.' })
+          if (content.length > 30_000) continue
+          this.acceptResult(id, ticket.revision, 'artifact', content, undefined, 'coordinator')
+          this.store.audit(id, 'workflow.artifact_handed_off', { planId: plan.id, version: plan.version })
+          accepted++
+        }
+      }
+      return accepted
+    })
+  }
+  canComplete(plan: Plan): boolean {
+    return !plan.held && !plan.completed && plan.ticketIds.every(id => {
+      const ticket = this.engine.require(id)
+      return !!ticket.result && !ticket.mandate.humanHold && !ticket.reconciliation && !ticket.stopping && ticket.inputs.every(entry => entry.state === 'settled') && validInputs(this.store, ticket) && !this.store.effects().some(effect => effect.ticketId === id && effect.state !== 'done') && !this.store.approvals(id).some(approval => approval.status === 'pending')
+    }) && !this.store.approvals(plan.id).some(approval => approval.status === 'pending')
+  }
   complete(planId: string, expectedRevision: number): void {
     this.store.atomic(() => {
       const plan = this.require<Plan>('plan', planId)
       this.check(plan.revision, expectedRevision)
-      requireCondition(!plan.held && !plan.completed && plan.ticketIds.every(id => {
-        const ticket = this.engine.require(id)
-        return ticket.result && !ticket.mandate.humanHold && !ticket.reconciliation && !ticket.stopping && ticket.inputs.every(entry => entry.state === 'settled') && validInputs(this.store, ticket) && !this.store.effects().some(effect => effect.ticketId === id && effect.state !== 'done') && !this.store.approvals(id).some(approval => approval.status === 'pending')
-      }) && !this.store.approvals(plan.id).some(approval => approval.status === 'pending'), 'INVALID_STATE', 'Every required task including integration must have a settled, accepted result')
+      requireCondition(this.canComplete(plan), 'INVALID_STATE', 'Every required task including integration must have a settled, accepted result')
       plan.completed = true; this.save('plan', plan, 'plan.completed')
     })
   }

@@ -1,5 +1,51 @@
 # Codex 本地任务服务使用说明
 
+## 推荐流程：一次目标确认
+
+详见 [020 · 中央协调工作流](020-centralized-workflow.md)。让主 Agent 打开当前项目并建立任务图；创建计划时可填写 `workflow: { automaticHandoffs: true, materialPaths: ["/absolute/reference.pdf"] }`，把业务决策节点标为 `reviewRequired: true`。只填写你明确提供的文件，不自动扫描目录。
+
+在控制台的计划页确认一次范围、依赖、预算、资料路径和人工里程碑。服务自动检查环境、启用受限运行时、创建只读快照并分发给成员；不需要另行解锁或逐任务附加。普通 artifact 节点在结构化报告和状态检查通过后自动交接；最终结果、人工里程碑、代码合并和外部发布仍保留人工边界。
+
+控制台的启动/恢复/重试确认是直接人工决定，无需再去审批中心申请一次。超预算重试仅追加一轮，不扩大基础自动预算。主 Agent 的公开 MCP 仍只能申请额外授权，不能代你批准。普通重启在重新检查通过且原授权未过期、指纹未变、无未知执行时复用授权。
+
+旧计划没有 `workflow` 时继续原有人工交接和独立运行时授权；不因升级自动获得资料权限。下方逐任务资料命令及运行时控制保留为高级/旧流程入口，不是新计划的必走步骤。
+
+## Worker 技能、工具链与只读资料
+
+Worker 不复制主会话的 HOME、插件、MCP、完整聊天记录或权限。按 [018 设计](018-worker-development-capabilities.md) 显式补齐开发能力，控制数据和其他任务仍隔离。
+
+**人工追加重试**：`maxAttempts` 仍是含首轮的基础分配额度。控制台选择“追加一轮并重试”并确认即可，无需二次审批；只授权唯一下一轮，不改计划上限，也不授权后续轮次。MCP 发起的超预算请求仍等待人确认。版本、到期时间、依赖、暂停、人工停止和未知执行检查继续生效。019 的预算模型保留，交互由 020 简化。
+
+**配置技能与工具链**：先停止并对账项目内执行，再关闭该项目服务。在可信终端执行；技能目录可多选，工具链只读根应只含程序和运行库，不要填写 HOME、仓库、其他 worktree 或凭据目录。
+
+```sh
+node packages/dist/service/src/cli.js runtime configure-capabilities --state /absolute/project-state --json '{"skills":["/absolute/path/to/pdf-parser"],"toolchain":{"pathEntries":["/opt/homebrew/bin"],"readRoots":["/opt/homebrew/Cellar"],"environment":{}}}'
+```
+
+命令交互确认 `configure-capabilities`，复制所选技能为带哈希的只读快照，并保留模型、provider、认证文件和子 Agent 设置。每次配置是完整替换能力配置；未列出的旧技能不保留。macOS 自动检测开发工具目录和真实 Git；可通过 `DEVELOPER_DIR`、`SDKROOT` 等白名单环境项显式覆盖。不会安装 `pdftotext`、Python 库等依赖。重启后由新计划的目标确认合并重新检查与启用；旧计划也可使用环境诊断入口。普通诊断不调用模型，新增 `toolchain_git` 检查在命名沙箱内执行。
+
+**提供 PDF 等任务资料**：新计划优先在 `workflow.materialPaths` 声明，随目标确认自动分发。旧任务或额外补充可在任务详情展开“只读参考资料”，填写绝对路径、预览并确认附加。只开放快照而非桌面源目录，源文件后续修改不自动同步。
+
+运行中或待派发任务先停止；附加不启动任务、不验收结果、不清除旧失败或 hold。附加后按原计划授权和预算显式恢复/重试。CLI 等价入口：
+
+```sh
+node packages/dist/service/src/cli.js materials preview --state /absolute/project-state --json '{"ticketId":"TASK_UUID","expectedRevision":1,"paths":["/absolute/reference.pdf"]}'
+node packages/dist/service/src/cli.js materials attach --state /absolute/project-state --json '{"ticketId":"TASK_UUID","expectedRevision":1,"previewId":"PREVIEW_UUID","requestId":"UNIQUE_REQUEST_ID"}'
+node packages/dist/service/src/cli.js materials list --state /absolute/project-state --json '{"ticketId":"TASK_UUID"}'
+```
+
+附加命令需可信终端交互确认，公共 MCP 不提供这些权限。资料与技能快照必须存储在系统临时目录之外。任务 Git common directory 开放写权限，信任 Worker 在分配的分支直接 `git add` / `git commit`，普通本地提交不另加审批。提示词要求只暂存任务文件、使用已配置身份、报告实际提交 SHA，不操作其他任务分支、不破坏历史、不修改共享配置；这些 Git 范围约束不是强隔离。fetch、push、切换分支和发布不由 Worker 自行执行，远端发布仍走服务审批。资料保持只读，工具网络仍关闭。详见 [023 设计](023-trusted-worker-git.md)。
+
+## 已批准但没有启动
+
+计划授权、计划暂停和 Worker 环境启用是独立状态。计划批准不会解除暂停；需要在“计划控制、授权与预算”中确认“恢复新派发”，不必重复申请计划授权。
+
+如果首个节点显示“等待运行环境”，检查 Worker 环境的具体原因。`PROCESS_OBSERVATION_FAILED` 表示本机进程身份检查失败或超时，不表示 Codex 版本一定不支持。macOS 使用只读 `libproc` 原生观察器，通过 `proc_listallpids` 和逐 PID 的 `proc_pidinfo` 读取 PID、父 PID、进程组和启动时间，不再依赖可能卡住的 `/bin/ps -axo pid=,ppid=,pgid=,lstart=` 或全量 `sysctl(KERN_PROC_ALL)`；Linux 继续使用 `ps`。其他用户的受保护进程保留可读的父 PID 和进程组，启动时间标记为不可验证；如果 Worker 或已观察后代出现这种情况，则阻止执行与清理确认，而不是忽略该进程。两种平台均使用异步、合并中的采样和独立的 3 秒截止时间，避免同步扫描阻塞控制台与调度；超时后终止观察器，未确认其退出前不重复创建，仍然阻止执行，不能跳过进程归属和后代清理检查。
+
+macOS 构建需要 Xcode Command Line Tools 提供的 `/usr/bin/cc`。在实际运行主机执行 `npm --prefix packages run build`，原生观察器会随构建生成并随运行包分发，其内容纳入运行时指纹。缺少或无法运行该程序时不会退回可能卡住的 `ps`，也不会绕过检查。重新构建改变运行时指纹后，重启项目服务并在目标控制中重新确认运行；相同指纹下的普通重启复用未过期授权，不需要重复启用。
+
+`Worker checkout contains .agents` 是旧版将仓库技能目录整体视为执行配置的误拦截。新版允许只有 `skills` 的真实 `.agents` 目录及指向 checkout 内部的技能链接，不删除主仓库的 `.agents`；`.codex`、未知执行配置、越界/循环链接和特殊文件仍然阻塞。预检失败后已创建的工作区会保留绑定；旧版遗留的未绑定工作区只有在同仓库、同任务分支、同基线且完全干净时才能复用。修复后重试仍受原计划授权和尝试预算约束；`maxAttempts: 1` 的已失败节点不能借重启或重复审批无限重试，需要新的计划授权与预算。
+
 ## Worker 内多 Agent
 
 新建 profile 支持一个 Worker 内主 Agent 带多个子 Agent，默认最多 3 个并发子 Agent、仅一层。任务详情可查看分工、状态与未验收结论；停止父任务会统一清理。子 Agent 共用任务 worktree，主 Agent 须划分不重叠的文件写集；需要分支隔离时仍拆成多个任务。详见 [017 设计](017-worker-subagents.md)。
@@ -10,11 +56,11 @@
 node packages/dist/service/src/cli.js runtime configure-profile --state /path/to/project-state --json '{"model":"YOUR_MODEL","provider":{"id":"openai","authMode":"openai"},"agents":{"enabled":true,"maxConcurrent":3,"maxDepth":1}}'
 ```
 
-重启该项目服务，重新诊断并人工启用；此配置命令本身不启动模型、不授予任务权限。关闭时使用 `agents.enabled=false`。自定义 provider 应保留该项目原来的 provider 配置，不要照抄成 OpenAI。
+重启该项目服务后，由新计划目标确认完成检查与重新授权；此配置命令本身不启动模型、不授予任务权限。关闭时使用 `agents.enabled=false`。自定义 provider 应保留该项目原来的 provider 配置，不要照抄成 OpenAI。
 
-当前是开发预览；先读 [实施/验收状态](codex-implementation-status.md)。**完整验收不再是 Worker 启动门槛；环境检查通过、人工启用并审批任务后允许派发。** 完整真实验收仍未完成，没有强制总 token/费用上限。初始化不会调用模型或推送代码。
+当前是开发预览；先读 [实施/验收状态](codex-implementation-status.md)。**新计划一次目标确认合并环境准备与任务图授权；完整验收不是启动硬门槛。** 完整真实验收仍未完成，没有强制总 token/费用上限。初始化不会调用模型或推送代码。
 
-当前准入规则见 [016 验收门槛移除](016-worker-verification-advisory.md)，它修订了 [014 原设计](014-worker-runtime-unlock.md) 和 [015 实施记录](015-worker-runtime-implementation.md) 的验收前置要求。控制台完成“重新诊断”后可“预览并启用”，不需要先做完整验证；启用仍不等于任务授权或真实执行验收通过。
+当前工作流见 [020](020-centralized-workflow.md)，运行时安全规则沿用 [016](016-worker-verification-advisory.md)。环境区仍提供高级诊断和显式启用，但新计划不需要分别操作；授权通过不等于真实执行验收通过。
 
 插件默认按**当前会话项目**工作，不再固定指向 insight-plugins1。先调用 `superagent_project_open`，传入真实会话的项目绝对路径，再读 health、建计划。宿主提供 MCP roots 时服务会校验；没有 roots 时由主对话明确传入上下文中的项目路径，不能猜测 MCP 进程 cwd。每个会话只绑定一个项目，项目间 state、审批和控制台隔离；同项目不同会话复用实例。首次项目初始化需要 `initialize=true` 及明确模型或事先配置的本机默认模型，不复制认证。详见 [012](012-session-project-binding.md)。
 
@@ -160,7 +206,7 @@ node packages/dist/service/src/cli.js approvals
 node packages/dist/service/src/cli.js approve APPROVAL_ID
 ```
 
-CLI 批准必须在真实交互终端内查看结构化摘要并完整输入该 approval ID；也可在登录后的本地控制台完成等价人工预览和确认。没有 `--yes`、批量自动批准或 MCP 自批准。当前即使批准任务，仍会等待运行环境验收和人工启用；effect 保持 pending，不消耗尝试预算，不判失败，也不启动编码模型。
+CLI 批准必须在真实交互终端内查看结构化摘要并完整输入该 approval ID；也可在登录后的本地控制台完成等价人工预览和确认。没有 `--yes`、批量自动批准或 MCP 自批准。新计划批准时自动准备受限环境；独立任务和旧计划仍需有效的运行时授权。等待环境时 effect 保持 pending，不消耗尝试预算，不冒充执行失败。
 
 追加输入需要 expectedRevision，不解除 stop。idle 问题答复后需显式 resume；失败/blocked 用 retry。控制停止的示例：
 
@@ -215,7 +261,7 @@ node packages/dist/service/src/cli.js panel --port 0
 
 仅监听 `127.0.0.1` 的随机端口。终端打印地址与独立登录令牌，在页面表单输入；不把 token 放 URL，不发给模型。登录会话一小时过期，重新登录会使旧会话与预览失效。
 
-审批中心先展示完整任务/计划/发布 diff 预览，人工输入完整审批 ID 后逐项批准或拒绝。预览最多五分钟、仅可消费一次；变化或超时需重新预览。发布预览先输入提交作者与邮箱；运行时权限扩张仍禁止批准。页面提供任务启动/恢复/重试/停止、计划启动/暂停派发/停止、结果验收和整体交付确认，必须输入目标 ID，使用当前版本校验。环境区提供诊断、可选验证预览、环境检查后的人工启用及 drain/stop 停用；完整验收不再是启用前提。没有任意管理 RPC、shell、凭据读取或自动合并入口。
+计划页直接展示目标确认、调度控制、依赖和阶段结论。普通启动/恢复/重试采用一次确认按钮，不再抄写目标 UUID 或跳转二次审批；公开 MCP 的授权申请仍在“需要你确认”中展示完整范围。预览最多五分钟、单次使用，变化后须重新预览。发布仍核对 diff、提交作者和完整审批 ID，运行时权限扩张仍禁止批准。健康环境折叠为诊断入口，保留高级检查及 drain/stop 停用。没有任意 shell、凭据读取或自动合并入口。
 
 常驻后台模式显式使用固定私有令牌文件：
 
@@ -279,7 +325,27 @@ node packages/dist/service/src/cli.js reconcile TICKET_ID \
 
 代码回滚用新增 revert 提交，数据库回滚前先停服、备份并检查 schema。未提供自动恢复旧版本数据的承诺。
 
-## 8. 本地分发包
+## 8. 删除任务与计划
+
+- 独立任务：进入任务详情 → **删除任务** → **预览删除范围** → 输入“删除” → 确认。
+- 关联计划：进入计划详情 → **删除整组计划**，核对全部成员后确认。不能单独删除计划成员，以免破坏依赖关系。
+- 执行中、排队、停止清理中或待核对的任务不能删除。先停止任务/整组，再等清理结束；删除不绕过运行环境核对。
+- 这是持久化逻辑删除：任务/计划从列表与调度中消失，审批过期、订阅解除。SQLite 保留 `deleted_task` / `deleted_plan` 快照、审计和阶段结论；工作区、分支、资料及远端 MR 原样保留。没有一键恢复，也不会释放这些文件的磁盘空间。
+- 删除使用版本检查和幂等请求 ID。状态变化后需重新预览；同一请求网络重试不会重复删除。MCP bridge 没有直接删除权限。
+
+可信终端也支持以下命令，必须交互输入完整目标 ID，不支持非交互式确认：
+
+```sh
+node packages/dist/service/src/cli.js task delete --state /absolute/project/state \
+  --json '{"ticketId":"TASK_ID","expectedRevision":1,"requestId":"UNIQUE_REQUEST_ID"}'
+
+node packages/dist/service/src/cli.js plan delete --state /absolute/project/state \
+  --json '{"planId":"PLAN_ID","expectedRevision":1,"requestId":"UNIQUE_REQUEST_ID","tasks":[{"ticketId":"TASK_ID","expectedRevision":1}]}'
+```
+
+ID、版本须取实际详情；计划 `tasks` 必须包含全部成员及对应当前版本。删除功能升级后，需要安全重启对应项目服务和控制台才能使用；不要为升级直接终止运行任务。
+
+## 9. 本地分发包
 
 ```sh
 cd packages
@@ -289,3 +355,17 @@ npm pack --pack-destination /absolute/path/to/output-directory
 prepack 会构建并只打包白名单中的新运行时。运行包依赖官方 MCP SDK/Zod 与面板相关 npm 依赖，不依赖 DSH；不会夹带 SQLite、凭据、测试仓库、旧源码、插件安装缓存或 node_modules。这里不自动 `npm install -g`，不上传 npm/GitLab。
 
 真实模型执行会把任务与必要代码上下文发送到所选模型供应商；本地 SQLite 不代表离线推理。
+
+## 计划工作区与基线（2026-11-21）
+
+计划可独立绑定完整本地引用，例如 `refs/remotes/origin/main` 或 `refs/remotes/origin/insight-v1`。这是**本地已存在引用**，不会自动 fetch，也不代表远端最新。服务负责创建 worktree；不要再要求 Worker 自行执行 `git worktree add`。
+
+- 新计划：`plan_create.workspace` 可指定 `repositoryId`、`baseRef`、`baseSha`、`branchPrefix`；服务核验引用与 SHA，目标确认覆盖这组字段。
+- 旧计划：在计划详情展开“计划工作区与基线” → 填完整引用及分支前缀 → 预览 → 输入计划 ID 确认切换 → 重新“确认目标并启动 / 恢复”。活动执行必须先安全停止；已有验收结果或 MR 的计划需保留原交付，另建计划，不原地迁移。
+- 原工作区、分支、未提交修改与历史都保留；新绑定生成新目录和分支，下次使用新 Worker 线程。独立停止不会自动解除，历史执行预算不会清零。
+- “等待工作区准备”表示模型尚未启动，本轮未领取、effect attempts 未增加。修复明确的本地引用/目录/配置问题后，在任务详情点击“重新检查工作区”，或协调器调用 `task_workspace_prepare`。不要靠反复重试模型解决 Git 准备问题。
+- GitLab 发布目标跟随计划绑定，发布仍需独立 diff 确认。固定基线缺少已接受代码依赖时明确阻塞，不自动 merge/cherry-pick；本轮不支持在已有验收结果的计划中改写基线。
+
+可信 CLI：`workspace preview|configure|prepare --json '{...}'`。预览参数为 `{planId, expectedRevision, repositoryId, baseRef, branchPrefix}`；配置参数为 `{planId, expectedRevision, previewId, requestId}`，CLI 会重新展示持久化预览并要求交互式确认；准备参数为 `{ticketId, expectedRevision}`。复用相同请求 ID 查询/重试未知配置响应，不直接改 SQLite。设计与边界见 [022](022-plan-workspaces.md)。
+
+源码构建不等于运行中服务已更新。上线时先检查运行任务并安全停止/对账，再重启对应项目服务；插件工具清单和 Skill 更新需重新安装/建立新 MCP 连接。本轮不自动迁移真实计划或批准执行。
